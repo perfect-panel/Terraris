@@ -22,6 +22,10 @@ Cryptographic primitives use `ml-kem`, `x25519-dalek`, `aes-gcm`, `chacha20poly1
 
 VLESS Encryption uses arbitrary binary contexts for BLAKE3 derivation; the standard Rust API accepts UTF-8 strings. This local reference copy accepts `&[u8]` instead, without using unchecked UTF-8 or unsafe code. The compression algorithm is unchanged. Retained material-bearing hasher state receives best-effort zeroization on drop; module documentation and lints are adjusted for inclusion. Independent Go fixtures cover binary contexts across block/chunk boundaries, record rekey context lengths, and both AEAD choices.
 
-## Test-only Xray client
+## Test-only Xray peers
 
-[tests/interop/encryption](tests/interop/encryption) is a separate Go module pinned to the same Xray commit. It is an optional interoperability test driver, not a Rust build dependency or a production process. The full Xray binary used by the end-to-end test is built from that same module version. Normal `cargo test` uses committed deterministic vectors and loopback Rust tests; the two external-client tests are explicitly ignored until their binary paths are provided.
+[tests/interop/encryption](tests/interop/encryption) is a separate Go module pinned to the same Xray commit. It is an optional interoperability test driver, not a Rust build dependency or a production process. The full Xray binary used by the end-to-end test is built from that same module version. Normal `cargo test` uses committed deterministic vectors and loopback Rust tests; the three external-peer tests are explicitly ignored until their binary paths are provided.
+
+## Routing and DNS
+
+The GeoSite/GeoIP protobuf field definitions follow the Xray `app/router` data format. The built-in private-address prefix list retains Polaris's routing semantics. Runtime selectors, range indexes, resource limits and transactional asset loading are implemented in Rust. DNS wire messages are encoded/decoded by `hickory-proto`; the resolver lifecycle, scoped selection, cache and transports are managed by Terraris. DoH follows RFC 8484 and DoT follows RFC 7858, with certificate verification supplied by rustls.

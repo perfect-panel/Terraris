@@ -8,6 +8,14 @@ license = "GPL-3.0-only"
 publish = false
 
 [dependencies]
+hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
+ipnet = "2.12"
+regex = "1.13"
+aho-corasick = "1.1"
+rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["aws_lc_rs", "tls12"] }
+webpki-roots = "1.0.11"
+rustls-pemfile = "2.2"
 aes = "0.8.4"
 aes-gcm = "0.10.3"
 base64 = "0.22"
@@ -39,6 +47,7 @@ prost-build = "0.14.4"
 protoc-bin-vendored = "3.3"
 
 [dev-dependencies]
+rcgen = "0.14.10"
 axum = "0.8"
 tempfile = "3"
 tokio = { version = "1", features = ["test-util", "process"] }

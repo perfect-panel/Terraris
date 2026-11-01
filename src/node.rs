@@ -153,6 +153,19 @@ pub struct Node {
 }
 impl Node {
     pub fn new(options: panel::ppanel::Options, settings: Settings) -> Result<Self, Error> {
+        Self::with_network(
+            options,
+            settings,
+            crate::dns::Settings::default(),
+            crate::route::Settings::default(),
+        )
+    }
+    pub fn with_network(
+        options: panel::ppanel::Options,
+        settings: Settings,
+        dns: crate::dns::Settings,
+        routing: crate::route::Settings,
+    ) -> Result<Self, Error> {
         settings.validate()?;
         let fingerprints = options.fingerprints.clone();
         let timeout = options.timeout;
@@ -172,13 +185,16 @@ impl Node {
             .map_err(|_| Error::Settings)?;
         let metrics = Metrics::default();
         let factory = Arc::new(
-            vless::Factory::new(
+            vless::Factory::with_network(
                 connection.clone(),
                 settings.protocol_options()?,
                 flow::Options {
                     max_entries: settings.max_users,
                     device_timeout: timeout.min(Duration::from_secs(10)),
                 },
+                dns,
+                routing,
+                metrics.clone(),
             )
             .map_err(Error::Runtime)?,
         );

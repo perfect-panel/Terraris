@@ -11,3 +11,9 @@ pub use io::{
     Datagram, DatagramEndpoint, DatagramTransport, Error, IoOperation, MAX_DATAGRAM_LIMIT,
     connect_tcp,
 };
+
+pub mod pipe;
+
+pub trait StreamIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> StreamIo for T {}
+pub type Stream = Box<dyn StreamIo>;

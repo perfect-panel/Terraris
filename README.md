@@ -2,7 +2,7 @@
 
 Terraris 是参考 Polaris 架构设计的 PPanel Rust 节点端项目，负责代理协议接入、用户认证、限速与设备准入，以及节点状态、在线设备和流量上报。
 
-当前已完成 B1–B4 基础设施与控制面，以及 B5 的 VLESS TCP、UDP/XUDP 和 VLESS Encryption 接入。`terraris run` 可运行实际 Rust 节点，包含用户撤销、共享限速、设备租约与计量。已通过本机 Xray 互通；持久化上报、其他传输/协议及生产部署验证仍待完成。
+当前已完成 B1–B4 基础设施与控制面、B5 的 VLESS TCP、UDP/XUDP 和 VLESS Encryption 接入，以及共享路由、DNS 和 SOCKS5/HTTP/VLESS 出站。`terraris run` 可运行实际 Rust 节点，包含用户撤销、共享限速、设备租约与计量。已通过本机 Xray 互通；持久化上报、其他传输/协议及生产部署验证仍待完成。
 
 - [架构设计](docs/architecture.md)：模块边界、状态管理、协议规划、故障处理与实施阶段。
 - [PPanel 接口契约](docs/ppanel-api.md)：当前 backend 的实际接口、身份与计量语义、兼容性要求。
@@ -10,6 +10,7 @@ Terraris 是参考 Polaris 架构设计的 PPanel Rust 节点端项目，负责�
 - [Buffer 系统设计](docs/buffer.md)：所有权、前后预留空间、共享切片、内存预算、池化和背压。
 - [B4 控制面与运行时](docs/control-plane.md)：事务提交、准入、代次切换、维护调度、报告与退出。
 - [B5 VLESS 接入](docs/vless.md)：当前协议组合、Encryption 参数、运行方式和 Xray 互通复现。
+- [路由、DNS 与代理出站](docs/routing-dns.md)：规则语义、GeoData、解析缓存、DoH/DoT、重载与验证。
 
 设计沿用 Polaris 的 `panel → supervisor/controller → protocol` 分层，以 `runtimekit` 统一运行时生命周期、以 `flow` 统一数据面策略。采用单进程、多协议结构，优先面向 Linux x86_64 和 aarch64。Rust 负责节点控制与协议集成；候选协议库必须能接入统一的用户策略、连接管理和流量计量。
 
@@ -35,15 +36,15 @@ Terraris 是参考 Polaris 架构设计的 PPanel Rust 节点端项目，负责�
 - VLESS 实际驱动支持 UUID 多用户、TCP/UDP/XUDP、三种 VLESS Encryption 外观和 1-RTT/0-RTT；使用统一的限速、设备和计量策略。
 - 同端口候选共享 accept loop，失败更新保留活跃服务；相同加密设置的重载保留恢复票据。
 
-当前载体为 TCP；TLS、REALITY、Vision 等非默认组合会拒绝。非零 GlobalID 现可跨承载连接及兼容配置代次迁移，保留 UDP 出口 socket；恢复仍需用户和设备准入。完整能力边界见 [VLESS 文档](docs/vless.md)。
+当前入站载体为 TCP；入站 TLS、REALITY、Vision 等非默认组合会拒绝。代理出站支持标准 TLS。非零 GlobalID 现可跨承载连接及兼容配置代次迁移，保留 UDP 出口 socket；恢复仍需用户和设备准入。完整能力边界见 [VLESS 文档](docs/vless.md)。
 
 ## DNS、限速和路由现状
 
 | 模块 | 已实现 | 尚未实现 |
 | --- | --- | --- |
-| DNS | 系统解析、地址族策略、候选地址上限、受持有的并发任务与退出回收 | 独立 DNS 引擎、自定义服务器/规则、应用缓存、DoH/DoT |
+| DNS | 分域 UDP/TCP/DoH/DoT、正负 TTL 缓存、并发合并、地址族策略、系统解析与退出回收 | DNSSEC 本地验证、DoQ、独立公网 DNS 监听 |
 | 限速 | 按协议和订阅共享的 TCP/UDP、上下行额度；等待取消与未使用额度退还 | 跨节点全局带宽限制 |
-| 路由 | 直连出站及地址族策略 | block/分流规则编译、策略路由和代理出站；相应非空配置会拒绝 |
+| 路由 | 域名/IP/CIDR/GeoSite/GeoIP、顺序分流、block、直连/DNS/SOCKS5/HTTP/VLESS 出站 | 本轮范围外的代理协议与传输；显式拒绝配置 |
 
 ## Resource 和 Buffer 使用约定
 

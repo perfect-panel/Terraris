@@ -15,9 +15,9 @@
 | 记录 | 认证的长度/记录头、增量 nonce、溢出后换钥、短读写、取消/截断/认证失败处理 |
 | 用户策略 | 热增删、改凭据撤销、跨连接和上下行共享限速、全局订阅/IP 设备准入、TTL 续期 |
 | 重载 | 同端口共享 accept loop，候选失败保留活跃路由，旧连接限时排空；相同 Encryption 配置保留票据缓存 |
-| 出站 | 系统 DNS、直连 TCP/UDP、地址族策略；配置了未实现的 DNS/路由/block/outbound 会拒绝候选 |
+| 出站 | 共享路由引擎、分域 DNS/缓存/DoH/DoT、直连/阻断/DNS/SOCKS5/HTTP/VLESS；见 [路由文档](routing-dns.md) |
 
-当前载体为 TCP。TLS、REALITY、Vision、XHTTP、WebSocket/gRPC 等组合没有实现；相关非默认字段会拒绝，不能仅凭 VLESS 名称认为所有组合均可用。VLESS 用户凭据须是可解析的 UUID，等价 UUID 编码冲突会拒绝整个用户快照。
+当前入站载体为 TCP。入站 TLS、REALITY、Vision、XHTTP、WebSocket/gRPC 等组合没有实现；相关非默认字段会拒绝，不能仅凭 VLESS 名称认为所有组合均可用。VLESS 用户凭据须是可解析的 UUID，等价 UUID 编码冲突会拒绝整个用户快照。
 
 XUDP 的 UDP socket 由进程级会话表持有，承载连接只持有当前接管许可。非零 GlobalID 可在保留期内迁移到新的承载连接，复用同一地址族的 UDP socket，保持出口端口；零 GlobalID 或缺失 GlobalID 使用连接内会话。普通 VLESS UDP 仍只接受指定目标的回复。
 
@@ -89,7 +89,7 @@ SIGINT/SIGTERM 先关闭准入，再排空、取消和等待任务回收，并�
 
 默认每连接 4 MiB / 256 个 buffer、32 个 XUDP 会话和 32 个回复队列报文。回复队列满时丢弃完整且尚未计费的 UDP 报文。物理 buffer 统一计入进程 Budget，私有握手和记录缓冲也使用 BufferScope。用户/任务/票据等元数据另有数量上限，不属于 buffer 字节口径，不能把 `memory_bytes` 当作 RSS 上限。
 
-现阶段使用操作系统 DNS，最多保留 16 个候选地址并限制解析并发。系统 resolver 使用最多 64 个受持有的 blocking 任务；请求取消不会提前释放其并发许可，关闭会等待实际调用返回，无法强制抢占操作系统调用。它和 HTTP/TLS 依赖内部资源不属于 Terraris 的 buffer 分配口径。自定义 DNS、路由和出站尚未编译接入；启用 VLESS 时遇到这些非空配置会保留旧代次并报告不支持。空协议列表或全部禁用时仍会关闭入站，不因无消费者的出站字段阻止停服。
+DNS/路由/出站由公共 `egress` 引擎执行，默认最多 64 个解析候选地址，支持有界应用缓存和查询合并。系统 resolver 使用受持有的 blocking 任务；请求取消不会提前释放其并发许可，关闭会等待实际调用返回，无法强制抢占操作系统调用。它和 HTTP/TLS 依赖内部资源不属于 Terraris 的 buffer 分配口径。策略变化会取消所有不兼容旧代次的连接，并清除旧 GlobalID 映射；兼容重载保留缓存和映射。空协议列表或全部禁用时仍会关闭入站，不因无消费者的出站字段阻止停服。详见 [路由与 DNS](routing-dns.md)。
 
 Reports 仍是内存队列。正常退出会冲刷，但崩溃不保留；PPanel 现有接口的 ACK 歧义仍可能造成重复计费。主机状态 sampler 仍是可选 library 端口，CLI 暂不发送主机 CPU/内存/磁盘数据。
 

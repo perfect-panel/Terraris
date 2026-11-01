@@ -6,56 +6,40 @@ use super::{
 };
 use crate::{
     buffer::{BufferScope, QueueLimits, bounded_queue},
-    network::{Address, DatagramEndpoint},
+    network::Address,
     protocol::flow::{Error, Session},
     time::{Deadline, OperationContext},
     users::Identity,
 };
-use std::{
-    collections::BTreeMap,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    sync::Arc,
-};
+use std::{collections::BTreeMap, net::IpAddr, sync::Arc};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 const MAX_PACKET: usize = 65507;
-async fn endpoint(
-    driver: &Driver,
-    target: SocketAddr,
-    buffers: BufferScope,
-    session: &Session,
-) -> Result<DatagramEndpoint, Error> {
-    let bind = if target.is_ipv4() {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
-    } else {
-        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
-    };
-    session
-        .run(DatagramEndpoint::bind(
-            bind,
-            buffers,
-            MAX_PACKET,
-            driver.core.metrics().clone(),
-            &session.context(),
-        ))
-        .await?
-        .map_err(|_| Error::Io(std::io::ErrorKind::AddrNotAvailable))
-}
 async fn target(
     driver: &Driver,
     address: &Address,
     session: &Session,
-) -> Result<SocketAddr, Error> {
+) -> Result<crate::egress::Plan, Error> {
     let context = session.context().child_with_deadline(
         Deadline::after(driver.options.handshake_timeout).map_err(|_| Error::InvalidOptions)?,
     );
-    Ok(session
-        .run(driver.egress.resolve(address, &context))
+    session
+        .run(
+            driver
+                .egress
+                .plan(address, crate::network::Network::Udp, &context),
+        )
         .await?
-        .map_err(|_| Error::Resolve)?[0])
+        .map_err(|error| {
+            if error == crate::egress::Error::Blocked {
+                Error::Blocked
+            } else {
+                Error::Resolve
+            }
+        })
 }
 async fn send(
-    socket: &DatagramEndpoint,
-    address: SocketAddr,
+    socket: &dyn crate::outbound::PacketPort,
+    address: &Address,
     packet: &[u8],
     session: &Arc<Session>,
     context: &OperationContext,
@@ -63,7 +47,7 @@ async fn send(
     let mut quota = session.quota(packet.len()).await?;
     let mut counter = session.reserve(true, packet.len())?;
     session
-        .run(socket.send_to(address, packet, context))
+        .run(socket.send(address, packet, context))
         .await?
         .map_err(|_| Error::Io(std::io::ErrorKind::ConnectionAborted))?;
     quota.commit(packet.len());
@@ -78,7 +62,11 @@ pub(super) async fn standard(
     buffers: BufferScope,
 ) -> Result<(), Error> {
     let destination = target(driver, &address, &session).await?;
-    let socket = endpoint(driver, destination, buffers.clone(), &session).await?;
+    let socket = driver
+        .egress
+        .packet(&destination, buffers.clone(), &session.context())
+        .await
+        .map_err(|_| Error::Resolve)?;
     session
         .run(wire::write_response(&mut stream))
         .await?
@@ -90,8 +78,8 @@ pub(super) async fn standard(
         let context = session.context();
         tokio::select! {
             _=tokio::time::sleep_until(last+driver.options.udp_idle_timeout)=>return Ok(()),
-            packet=reader.next()=>{let Some(packet)=packet.map_err(|_|Error::Io(std::io::ErrorKind::InvalidData))?else{return Ok(());};send(&socket,destination,packet.as_slice(),&session,&context).await?;last=tokio::time::Instant::now();}
-            received=socket.recv(&context)=>{let received=received.map_err(|_|Error::Io(std::io::ErrorKind::ConnectionAborted))?;if received.source!=destination{continue;}let n=received.payload.len();let mut quota=session.quota(n).await?;let mut counter=session.reserve(false,n)?;session.run(async{write.write_all(&(n as u16).to_be_bytes()).await?;write.write_all(received.payload.as_slice()).await?;write.flush().await}).await?.map_err(|e:std::io::Error|Error::Io(e.kind()))?;quota.commit(n);counter.commit(n as u64);last=tokio::time::Instant::now();}
+            packet=reader.next()=>{let Some(packet)=packet.map_err(|_|Error::Io(std::io::ErrorKind::InvalidData))?else{return Ok(());};send(socket.as_ref(),&destination.address,packet.as_slice(),&session,&context).await?;last=tokio::time::Instant::now();}
+            received=socket.recv(&context)=>{let received=received.map_err(|_|Error::Io(std::io::ErrorKind::ConnectionAborted))?;if destination.address.socket_addr().is_some()&&received.source!=destination.address{continue;}let n=received.payload.len();let mut quota=session.quota(n).await?;let mut counter=session.reserve(false,n)?;session.run(async{write.write_all(&(n as u16).to_be_bytes()).await?;write.write_all(received.payload.as_slice()).await?;write.flush().await}).await?.map_err(|e:std::io::Error|Error::Io(e.kind()))?;quota.commit(n);counter.commit(n as u64);last=tokio::time::Instant::now();}
         }
     }
 }
@@ -239,9 +227,15 @@ pub(super) async fn multiplex(
                 .unwrap_or(&state.lease.target);
             let operation = async {
                 let destination = target(driver, address, &state.lease.binding.session).await?;
-                state.lease.send(destination, payload.as_slice()).await
+                state
+                    .lease
+                    .send(&destination, &driver.egress, payload.as_slice())
+                    .await
             };
             let result = state.lease.binding.context.run(operation).await;
+            if matches!(result, Ok(Err(Error::Blocked))) {
+                continue;
+            }
             if !matches!(result, Ok(Ok(()))) {
                 streams.remove(&id);
                 sender
@@ -311,9 +305,7 @@ async fn write_outputs<W: AsyncWrite + Unpin>(
                             status: xudp::Status::Keep,
                             data: true,
                             error: false,
-                            target: Some(
-                                Address::from_socket(packet.source).map_err(|_| Error::Resolve)?,
-                            ),
+                            target: Some(packet.source.clone()),
                             global_id: None,
                         };
                         started = true;

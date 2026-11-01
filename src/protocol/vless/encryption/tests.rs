@@ -199,3 +199,66 @@ async fn handshake_timeout_reclaims_budget_and_does_not_poll_after_close() {
         Err(Error::Closed)
     ));
 }
+
+#[tokio::test]
+async fn native_client_handshakes_and_resumes_with_all_appearances_and_key_kinds() {
+    use ml_kem::{KeyExport, ml_kem_768::DecapsulationKey};
+    use x25519_dalek::{PublicKey, StaticSecret};
+    let context = OperationContext::new(
+        CancellationToken::new(),
+        Some(Deadline::after(Duration::from_secs(10)).unwrap()),
+    );
+    for mode in ["native", "xorpub", "random"] {
+        for post_quantum in [false, true] {
+            let (private, public) = if post_quantum {
+                let seed = [0x38; 64];
+                let key = DecapsulationKey::from_seed(seed.into());
+                (
+                    URL_SAFE_NO_PAD.encode(seed),
+                    URL_SAFE_NO_PAD.encode(key.encapsulation_key().to_bytes()),
+                )
+            } else {
+                let key = [0x52; 32];
+                (
+                    URL_SAFE_NO_PAD.encode(key),
+                    URL_SAFE_NO_PAD.encode(PublicKey::from(&StaticSecret::from(key)).as_bytes()),
+                )
+            };
+            let server = Server::new(
+                Config::parse(&format!("mlkem768x25519plus.{mode}.60s.{private}")).unwrap(),
+                Limits::default(),
+            )
+            .unwrap();
+            let client = Client::new(
+                ClientConfig::parse(&format!("mlkem768x25519plus.{mode}.0rtt.{public}")).unwrap(),
+            );
+            let (budget, scope) = buffers();
+            for _ in 0..3 {
+                let (a, b) = tokio::io::duplex(65536);
+                let client_work = async {
+                    let mut io = client.handshake(a, &scope, &context).await.unwrap();
+                    io.write_all(b"client payload").await.unwrap();
+                    io.flush().await.unwrap();
+                    let mut response = [0; 14];
+                    io.read_exact(&mut response).await.unwrap();
+                    assert_eq!(&response, b"server payload");
+                };
+                let server_work = async {
+                    let mut io = server.handshake(b, &scope, &context).await.unwrap();
+                    let mut data = [0; 14];
+                    io.read_exact(&mut data).await.unwrap();
+                    assert_eq!(&data, b"client payload");
+                    io.write_all(b"server payload").await.unwrap();
+                    io.flush().await.unwrap();
+                };
+                context
+                    .run(async {
+                        tokio::join!(client_work, server_work);
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(budget.snapshot().used().bytes(), 0);
+            }
+        }
+    }
+}

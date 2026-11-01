@@ -3,7 +3,9 @@
 // See THIRD_PARTY.md and LICENSES/MPL-2.0.txt.
 
 mod blake3_reference;
+mod client;
 mod config;
+pub use client::{Client, ClientConfig};
 mod crypto;
 mod keys;
 mod server;

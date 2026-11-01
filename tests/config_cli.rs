@@ -139,3 +139,26 @@ fn node_settings_enforce_resource_and_timeout_relationships() {
     assert!(!value.node.allow_plaintext);
     assert_eq!(value.node.max_handshakes, 128);
 }
+
+#[test]
+fn network_settings_validate_limits_and_resolve_assets_against_the_config_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("terraris.toml");
+    fs::write(&path,format!("{}\n[dns]\nca_file='dns.pem'\ncache_entries=0\n[routing]\ngeosite='geosite.dat'\ngeoip='geoip.dat'\noutbound_ca_file='proxy.pem'\n",config("secret_file='secret'"))).unwrap();
+    let loaded = Config::load(&path).unwrap();
+    assert_eq!(loaded.dns.ca_file, Some(dir.path().join("dns.pem")));
+    assert_eq!(loaded.routing.geoip, Some(dir.path().join("geoip.dat")));
+    assert_eq!(
+        loaded.routing.outbound_ca_file,
+        Some(dir.path().join("proxy.pem"))
+    );
+    for extra in [
+        "[dns]\nconcurrency=0",
+        "[dns]\nmax_waiters=0",
+        "[dns]\nunknown=true",
+        "[routing.limits]\nmax_selectors=0",
+        "[routing.limits]\nasset_bytes=0",
+    ] {
+        assert!(Config::parse(&format!("{}\n{extra}", config("secret_env='KEY'"))).is_err());
+    }
+}

@@ -39,6 +39,10 @@ pub struct EncryptedStream<S> {
     pending_write: usize,
     pending_hash: [u8; 32],
     failed: bool,
+    server_iv: Option<(super::crypto::Cipher, bool)>,
+    iv: [u8; 16],
+    iv_have: usize,
+    resume: Option<super::client::Resume>,
 }
 impl<S> EncryptedStream<S> {
     pub(crate) fn new(io: S, state: State, buffers: &BufferScope) -> Result<Self, Error> {
@@ -64,9 +68,22 @@ impl<S> EncryptedStream<S> {
             pending_write: 0,
             pending_hash: [0; 32],
             failed: false,
+            server_iv: None,
+            iv: [0; 16],
+            iv_have: 0,
+            resume: None,
         })
     }
+    pub(crate) fn pending_server_iv(&mut self, cipher: super::crypto::Cipher, masked: bool) {
+        self.server_iv = Some((cipher, masked));
+    }
+    pub(crate) fn resume_guard(&mut self, resume: Option<super::client::Resume>) {
+        self.resume = resume;
+    }
     fn fail<T>(&mut self, error: impl Into<io::Error>) -> Poll<io::Result<T>> {
+        if let Some(resume) = self.resume.take() {
+            resume.invalidate();
+        }
         self.failed = true;
         Poll::Ready(Err(error.into()))
     }
@@ -83,6 +100,27 @@ impl<S: AsyncRead + Unpin> AsyncRead for EncryptedStream<S> {
         }
         if read.remaining() == 0 {
             return Poll::Ready(Ok(()));
+        }
+        if let Some((cipher, masked)) = this.server_iv {
+            while this.iv_have < 16 {
+                let mut input = ReadBuf::new(&mut this.iv[this.iv_have..]);
+                match Pin::new(&mut this.io).poll_read(cx, &mut input) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(e)) => return this.fail(e),
+                    Poll::Ready(Ok(())) => {
+                        let n = input.filled().len();
+                        if n == 0 {
+                            return this.fail(io::ErrorKind::UnexpectedEof);
+                        }
+                        this.iv_have += n;
+                    }
+                }
+            }
+            this.state.read = Aead::new(&this.iv, this.state.key.as_ref(), cipher);
+            if masked {
+                this.state.read_mask = Some(Mask::new(this.state.key.as_ref(), &this.iv));
+            }
+            this.server_iv = None;
         }
         if this.plain.0 < this.plain.1 {
             let n = read.remaining().min(this.plain.1 - this.plain.0);
@@ -155,6 +193,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for EncryptedStream<S> {
         if let Some(next) = rekey {
             this.state.read = next;
         }
+        this.resume = None;
         this.header_have = 0;
         this.body_have = 0;
         this.body_length = None;

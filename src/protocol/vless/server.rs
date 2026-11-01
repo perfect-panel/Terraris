@@ -46,12 +46,31 @@ pub struct Factory {
     handshakes: Arc<Semaphore>,
     encryption_cache: Mutex<BTreeMap<[u8; 32], Weak<encryption::Server>>>,
     associations: Arc<super::associations::Registry>,
+    egresses: Arc<crate::egress::Registry>,
+    metrics: crate::telemetry::Metrics,
 }
 impl Factory {
     pub fn new(
         connection: Arc<dyn Connection>,
         options: Options,
         policy_options: flow::Options,
+    ) -> Result<Self, runtime::Error> {
+        Self::with_network(
+            connection,
+            options,
+            policy_options,
+            crate::dns::Settings::default(),
+            crate::route::Settings::default(),
+            crate::telemetry::Metrics::default(),
+        )
+    }
+    pub fn with_network(
+        connection: Arc<dyn Connection>,
+        options: Options,
+        policy_options: flow::Options,
+        dns: crate::dns::Settings,
+        routing: crate::route::Settings,
+        metrics: crate::telemetry::Metrics,
     ) -> Result<Self, runtime::Error> {
         options.validate()?;
         let policies = Arc::new(
@@ -65,6 +84,9 @@ impl Factory {
             connections: Arc::new(Semaphore::new(options.max_connections)),
             handshakes: Arc::new(Semaphore::new(options.max_handshakes)),
             associations: super::associations::Registry::new(options.clone()),
+            egresses: crate::egress::Registry::new(dns, routing, options.max_connections)
+                .map_err(|_| runtime::Error::Preparation("egress settings"))?,
+            metrics,
             options,
             encryption_cache: Mutex::new(BTreeMap::new()),
         })
@@ -78,6 +100,7 @@ impl RuntimeFactory for Factory {
     type Shared = Egress;
     fn abort(&self) {
         self.associations.abort();
+        self.egresses.abort();
     }
     async fn close(&self, context: &OperationContext) -> Result<(), runtime::Error> {
         self.associations
@@ -87,7 +110,13 @@ impl RuntimeFactory for Factory {
                     .unwrap_or_else(|| Deadline::at(tokio::time::Instant::now())),
             )
             .await;
-        Ok(())
+        self.egresses
+            .close(context)
+            .await
+            .map_err(|_| runtime::Error::Preparation("egress close"))
+    }
+    fn published(&self, shared: &Self::Shared) {
+        self.associations.retain_policy(shared.migration_scope());
     }
 
     fn supports(&self, protocol: &ProtocolName) -> bool {
@@ -103,7 +132,10 @@ impl RuntimeFactory for Factory {
         buffers
             .child(self.options.connection_buffers)
             .map_err(|_| runtime::Error::Preparation("connection buffer limits"))?;
-        Egress::new(&config)
+        self.egresses
+            .open(&config, buffers, self.metrics.clone(), context)
+            .await
+            .map_err(|_| runtime::Error::Preparation("routing/DNS/outbound configuration"))
     }
     async fn prepare_protocol(
         &self,
@@ -325,7 +357,7 @@ impl Driver {
                 .map_err(|_| flow::Error::InvalidOptions)?,
         );
         let upstream = session
-            .run(self.egress.connect(target, &context, self.core.metrics()))
+            .run(self.egress.connect(target, &context, buffers.clone()))
             .await?
             .map_err(|_| flow::Error::Resolve)?;
         session.check()?;

@@ -121,6 +121,12 @@ pub async fn run() -> Result<(), Error> {
             println!("proxy protocols: vless (TCP, UDP, XUDP; mlkem768x25519plus)");
             println!("transports: TCP; encryption native/xorpub/random, 1-RTT/0-RTT");
             println!(
+                "routing: ordered domain/IP/GeoSite/GeoIP rules; direct/block/DNS/SOCKS5/HTTP/VLESS outbounds"
+            );
+            println!(
+                "dns: scoped UDP/TCP/DoH/DoT, bounded TTL and negative cache, query coalescing"
+            );
+            println!(
                 "runtime: scheduler, transactional users, device admission, shared user rate limits, accounting and generation handoff"
             );
         }
@@ -155,7 +161,8 @@ pub async fn run() -> Result<(), Error> {
 async fn run_node(path: PathBuf) -> Result<(), Error> {
     let config = config::Config::load(&path).map_err(Error::Config)?;
     let options = config.connection_options(&path).map_err(Error::Config)?;
-    let node = crate::node::Node::new(options, config.node).map_err(Error::Node)?;
+    let node = crate::node::Node::with_network(options, config.node, config.dns, config.routing)
+        .map_err(Error::Node)?;
     let cancellation = crate::task::CancellationToken::new();
     let context = crate::time::OperationContext::new(cancellation.clone(), None);
     let run = async {

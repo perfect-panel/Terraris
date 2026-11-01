@@ -6,7 +6,8 @@
 use super::options::Options;
 use crate::{
     buffer::{BufferScope, BufferSender, QueueItem},
-    network::{Datagram, DatagramEndpoint},
+    egress::{Handle as Egress, Plan, PortKey},
+    outbound::{Packet as Datagram, PacketPort},
     protocol::{
         flow::{Error, Session},
         runtimekit::Core,
@@ -19,7 +20,6 @@ use crate::{
 use std::{
     collections::{HashMap, VecDeque},
     future::poll_fn,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
         Arc, Mutex, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -27,12 +27,11 @@ use std::{
     time::Duration,
 };
 use tokio::{sync::Mutex as AsyncMutex, time::Instant};
-pub(super) const MAX_PACKET: usize = 65507;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct Key {
     identity: Identity,
-    egress: u8,
+    egress: [u8; 32],
     global: [u8; 8],
 }
 struct Index {
@@ -160,12 +159,12 @@ pub(super) struct Entry {
     identity: Identity,
     store: Store,
     buffers: BufferScope,
-    metrics: Metrics,
     registry: Weak<Registry>,
     cancel: CancellationToken,
     closed: AtomicBool,
     state: Mutex<State>,
-    sockets: Mutex<HashMap<bool, DatagramEndpoint>>,
+    sockets: Mutex<HashMap<PortKey, Arc<dyn PacketPort>>>,
+    policy: [u8; 32],
     bind_gate: AsyncMutex<()>,
     idle: Duration,
     resume: Duration,
@@ -175,6 +174,7 @@ pub(super) struct Lease {
     entry: Arc<Entry>,
     pub(super) binding: Arc<Binding>,
     pub(super) target: crate::network::Address,
+    handshake_timeout: Duration,
 }
 impl Drop for Lease {
     fn drop(&mut self) {
@@ -190,16 +190,21 @@ impl Lease {
             && self.binding.context.check().is_ok()
             && self.binding.session.check().is_ok()
     }
-    pub(super) async fn send(&self, address: SocketAddr, packet: &[u8]) -> Result<(), Error> {
+    pub(super) async fn send(
+        &self,
+        plan: &Plan,
+        egress: &Egress,
+        packet: &[u8],
+    ) -> Result<(), Error> {
         self.binding
             .context
             .run(self.binding.session.run(async {
-                let socket = self.entry.socket(self, address).await?;
+                let socket = self.entry.socket(self, plan, egress).await?;
                 let mut quota = self.binding.session.quota(packet.len()).await?;
                 let mut counter = self.binding.session.reserve(true, packet.len())?;
                 self.binding.context.check().map_err(|_| Error::Stopped)?;
                 socket
-                    .send_to(address, packet, &self.binding.context)
+                    .send(&plan.address, packet, &self.binding.context)
                     .await
                     .map_err(|_| Error::Io(std::io::ErrorKind::ConnectionAborted))?;
                 quota.commit(packet.len());
@@ -315,7 +320,7 @@ impl Registry {
         self: &Arc<Self>,
         core: &Core,
         identity: &Identity,
-        egress: u8,
+        egress: [u8; 32],
         global: Option<[u8; 8]>,
         id: u16,
         serial: u64,
@@ -371,7 +376,6 @@ impl Registry {
                         identity: identity.clone(),
                         store: core.users().clone(),
                         buffers,
-                        metrics: core.metrics().clone(),
                         registry: Arc::downgrade(self),
                         cancel: self.cancel.child_token(),
                         closed: AtomicBool::new(false),
@@ -383,6 +387,7 @@ impl Registry {
                             expires: None,
                         }),
                         sockets: Mutex::new(HashMap::new()),
+                        policy: egress,
                         bind_gate: AsyncMutex::new(()),
                         idle: self.options.udp_idle_timeout,
                         resume: self.options.xudp_resume_timeout,
@@ -408,6 +413,7 @@ impl Registry {
                         entry,
                         binding,
                         target,
+                        handshake_timeout: self.options.handshake_timeout,
                     });
                 }
                 Err(Error::Stopped) => {
@@ -418,7 +424,11 @@ impl Registry {
         }
         Err(Error::Stopped)
     }
-    fn reader(self: &Arc<Self>, entry: Arc<Entry>, socket: DatagramEndpoint) -> Result<(), Error> {
+    fn reader(
+        self: &Arc<Self>,
+        entry: Arc<Entry>,
+        socket: Arc<dyn PacketPort>,
+    ) -> Result<(), Error> {
         let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
         let group = jobs.group.as_mut().ok_or(Error::Stopped)?;
         while group.try_join_next().is_some() {}
@@ -429,7 +439,7 @@ impl Registry {
                 loop {
                     match socket.recv(&context).await {
                         Ok(packet) => entry.deliver(packet),
-                        Err(crate::network::Error::Buffer(_)) => {
+                        Err(crate::outbound::Error::Capacity) => {
                             if context
                                 .run(tokio::time::sleep(Duration::from_millis(100)))
                                 .await
@@ -438,7 +448,6 @@ impl Registry {
                                 break;
                             }
                         }
-                        Err(crate::network::Error::DatagramTooLarge { .. }) => {}
                         Err(_) => break,
                     }
                     if context.check().is_err() {
@@ -449,6 +458,13 @@ impl Registry {
             })
             .map_err(|_| Error::Capacity)?;
         Ok(())
+    }
+    pub(super) fn retain_policy(&self, policy: [u8; 32]) {
+        for entry in self.entries() {
+            if entry.policy != policy {
+                entry.close();
+            }
+        }
     }
     pub(super) fn snapshot(&self) -> Snapshot {
         self.prune();
@@ -700,47 +716,42 @@ impl Entry {
     async fn socket(
         self: &Arc<Self>,
         lease: &Lease,
-        target: SocketAddr,
-    ) -> Result<DatagramEndpoint, Error> {
-        let _gate = lease
-            .binding
-            .context
+        plan: &Plan,
+        egress: &Egress,
+    ) -> Result<Arc<dyn PacketPort>, Error> {
+        let context = lease.binding.context.child_with_deadline(
+            Deadline::after(lease.handshake_timeout).map_err(|_| Error::InvalidOptions)?,
+        );
+        let _gate = context
             .run(self.bind_gate.lock())
             .await
             .map_err(|_| Error::Stopped)?;
         if self.closed.load(Ordering::Acquire) {
             return Err(Error::Stopped);
         }
-        let family = target.is_ipv6();
         if let Some(socket) = self
             .sockets
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(&family)
+            .get(&plan.port_key)
         {
             return Ok(socket.clone());
         }
-        let address = if family {
-            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
-        } else {
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
-        };
-        let socket = DatagramEndpoint::bind(
-            address,
-            self.buffers.clone(),
-            MAX_PACKET,
-            self.metrics.clone(),
-            &lease.binding.context,
-        )
-        .await
-        .map_err(|_| Error::Capacity)?;
+        if self.sockets.lock().unwrap_or_else(|e| e.into_inner()).len() >= 64 {
+            return Err(Error::Capacity);
+        }
+        let socket = egress
+            .packet(plan, self.buffers.clone(), &context)
+            .await
+            .map_err(|_| Error::Capacity)?;
         {
             let mut sockets = self.sockets.lock().unwrap_or_else(|e| e.into_inner());
-            lease.binding.context.check().map_err(|_| Error::Stopped)?;
+            context.check().map_err(|_| Error::Stopped)?;
             if self.closed.load(Ordering::Acquire) {
+                socket.abort();
                 return Err(Error::Stopped);
             }
-            sockets.insert(family, socket.clone());
+            sockets.insert(plan.port_key, socket.clone());
         }
         if let Err(error) = self
             .registry
@@ -774,10 +785,10 @@ impl Entry {
             binding.stop();
             binding.end();
         }
-        self.sockets
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        let sockets = std::mem::take(&mut *self.sockets.lock().unwrap_or_else(|e| e.into_inner()));
+        for socket in sockets.into_values() {
+            socket.abort();
+        }
         drop(pending);
         if let Some(registry) = self.registry.upgrade() {
             registry.remove_closed(self.id, self.key.as_ref());

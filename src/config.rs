@@ -20,6 +20,10 @@ pub struct Config {
     pub panel: PanelConfig,
     #[serde(default)]
     pub node: crate::node::Settings,
+    #[serde(default)]
+    pub dns: crate::dns::Settings,
+    #[serde(default)]
+    pub routing: crate::route::Settings,
 }
 
 #[derive(Deserialize)]
@@ -72,7 +76,22 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self, Error> {
         let body = read_bounded(path, 256 * 1024)
             .map_err(|_| Error("cannot read configuration (limit: 256 KiB)"))?;
-        Self::parse(&body)
+        let mut config = Self::parse(&body)?;
+        let base = path.parent().unwrap_or(Path::new("."));
+        for asset in [
+            &mut config.dns.ca_file,
+            &mut config.routing.geosite,
+            &mut config.routing.geoip,
+            &mut config.routing.outbound_ca_file,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if asset.is_relative() {
+                *asset = base.join(&*asset);
+            }
+        }
+        Ok(config)
     }
 
     pub fn parse(body: &str) -> Result<Self, Error> {
@@ -90,6 +109,13 @@ impl Config {
         self.node
             .validate()
             .map_err(|_| Error("invalid node limits or timeouts"))?;
+        self.dns
+            .validate()
+            .map_err(|_| Error("invalid DNS settings"))?;
+        self.routing
+            .limits
+            .validate()
+            .map_err(|_| Error("invalid routing limits"))?;
         let p = &self.panel;
         if p.secret_env.is_some() == p.secret_file.is_some() {
             return Err(Error(

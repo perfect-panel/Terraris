@@ -32,3 +32,33 @@ idle_timeout_seconds = 300
 udp_idle_timeout_seconds = 60
 drain_timeout_seconds = 30
 shutdown_timeout_seconds = 5
+
+# Upstream addresses and domain routing come from PPanel's dns/outbound fields.
+[dns]
+cache_entries = 1024
+cache_bytes = 8388608
+concurrency = 64
+max_waiters = 4096
+timeout_seconds = 5
+max_ttl_seconds = 86400
+negative_ttl_seconds = 300
+max_answers = 64
+intercept = true
+# ca_file = "dns-ca.pem" # extra roots, relative to this file
+# [dns.bootstrap]
+# "resolver.example.com" = ["127.0.0.1"] # replace with your resolver's real address
+
+[routing]
+# Required only when a rule references that data file. Replace assets atomically.
+# geosite = "geosite.dat"
+# geoip = "geoip.dat"
+# outbound_ca_file = "proxy-ca.pem"
+
+[routing.limits]
+max_rules = 1024
+max_selectors = 500000
+max_selector_bytes = 67108864
+max_regex = 256
+regex_bytes = 1048576
+max_categories = 128
+asset_bytes = 134217728

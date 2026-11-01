@@ -49,7 +49,7 @@ TCP 字节流和 UDP 数据报分别建模。QUIC 流可以交付字节流接口
 
 初期使用一个 Cargo package，包含二进制入口和可测试的内部模块，模块命名与 Polaris 对齐。现成 Rust 协议引擎以依赖引入；需要自研且可独立复用的引擎再单独拆 crate。crate 数量不决定架构分层，跨模块依赖规则从第一版生效。
 
-当前 DNS 仅为有并发上限的系统解析封装；限速已实现按协议/订阅共享；路由仍只有直连和地址族策略，没有规则编译或代理出站。下表中的 `route` / `dns` / `outbound` 是目标模块，不表示已经完成。
+`route` / `dns` / `outbound` 已实现独立模块并由公共 `egress` 接入 VLESS TCP/UDP/XUDP：顺序规则、GeoData、分域 DNS、缓存、DoH/DoT，以及直连/阻断/DNS/SOCKS5/HTTP/VLESS 出站。限速按协议/订阅共享。实现语义和当前范围见 [路由与 DNS](routing-dns.md)。
 
 以下是目标模块划分；当前已实现 `app`、`config`、`panel` 及 B1–B4 基础设施和控制面。B5 已引入 VLESS、flow、限速和设备执行器；其余目标模块按后续阶段实施：
 
@@ -231,7 +231,7 @@ QUIC Endpoint 持有连接状态，不能直接把 TCP 的 reuseport 策略用�
 
 限速采用协议作用域内共享的用户令牌桶，避免每开一个连接就获得一份完整带宽。TCP 等待额度并响应取消；UDP 使用有界排队或丢包，不无限缓冲。单位换算为 `Mbps × 1,000,000 / 8` 字节每秒，0 表示不限速。
 
-DNS 和出站使用结构化能力声明。像 Polaris 的共享 Egress 一样，每个配置代次只创建一份可共享的 Router、Resolver 与 OutboundSet，各协议持有引用；协议自身的上游会话池在对应出站内维护。首条数据路径可只支持直连及基础 DNS，但只要面板配置了尚未支持的 block、路由、DNS 或 outbound 语义，就拒绝该候选，不默默回退直连。目标策略在域名及实际拨号 IP 两处校验，避免解析结果绕过限制。
+DNS 和出站使用结构化能力声明。像 Polaris 的共享 Egress 一样，每个配置代次只创建一份可共享的 Router、Resolver 与 OutboundSet，各协议持有引用；协议自身的上游会话池在对应出站内维护。共享引擎已经编译规则和 DNS 配置；相同策略的配置代次复用缓存及出站，未知选项仍拒绝候选，代理失败不回退直连。目标策略在域名及实际拨号 IP 两处校验，避免解析结果绕过限制。
 
 `transport` 处理协议载体，`certificate` 管证书，`mixed_ingress` 处理有明确分类依据的同端口分发。这些能力不归某个 Shadowsocks 或 VLESS 模块所有；首版未实现端口复用时显式拒绝冲突，不用模糊嗅探猜测。
 
@@ -283,7 +283,7 @@ DNS 和出站使用结构化能力声明。像 Polaris 的共享 Egress 一样�
 | 面板 HTTP | [reqwest](https://docs.rs/reqwest/latest/reqwest/) | 连接池、超时、响应大小限制、禁止自动跨源重定向、日志去除 URL query |
 | HTTP Protobuf | [prost](https://docs.rs/prost/latest/prost/) | 使用 backend schema 生成 DTO；不是 gRPC，不需要 tonic |
 | TLS | [rustls](https://docs.rs/rustls/latest/rustls/) | 证书热替换、密码 provider、目标平台；常规 TLS 不代表支持 REALITY |
-| DNS | [Hickory Resolver](https://docs.rs/hickory-resolver/latest/hickory_resolver/) | 面板 DNS 规则、缓存、IPv4/IPv6 策略和超时 |
+| DNS | `hickory-proto` + Tokio/rustls/reqwest | DNS wire 编解码；Terraris 持有分域规则、缓存、并发、IPv4/IPv6 策略和超时 |
 | QUIC | [Quinn](https://docs.rs/quinn/latest/quinn/) | 流、DATAGRAM、资源限额；需额外实现 TUIC/Hysteria2 的协议层 |
 | Shadowsocks | [shadowsocks-rust 的库接口](https://docs.rs/shadowsocks/latest/shadowsocks/config/struct.ServerConfig.html) | EIH 多用户、认证身份提取、热更新、TCP/UDP 和计量接入 |
 

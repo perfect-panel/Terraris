@@ -38,6 +38,7 @@ pub enum Error {
     Io(io::ErrorKind),
     Resolve,
     Unsupported,
+    Blocked,
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

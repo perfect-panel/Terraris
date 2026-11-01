@@ -63,9 +63,25 @@ impl Node {
         .await
     }
     async fn with_options(
+        configure: impl FnMut(&mut Value),
+        userlist: Value,
+        protocol_options: vless::Options,
+    ) -> Self {
+        Self::with_network(
+            configure,
+            userlist,
+            protocol_options,
+            terraris::dns::Settings::default(),
+            terraris::route::Settings::default(),
+        )
+        .await
+    }
+    async fn with_network(
         mut configure: impl FnMut(&mut Value),
         userlist: Value,
         protocol_options: vless::Options,
+        dns: terraris::dns::Settings,
+        routing: terraris::route::Settings,
     ) -> Self {
         let address = unused().await;
         let mut value = config(address);
@@ -76,10 +92,13 @@ impl Node {
         let pins = options.fingerprints.clone();
         let connection: Arc<dyn Connection> = Arc::new(PPanelConnection::new(options).unwrap());
         let factory = Arc::new(
-            vless::Factory::new(
+            vless::Factory::with_network(
                 connection.clone(),
                 protocol_options,
                 flow::Options::default(),
+                dns,
+                routing,
+                Metrics::default(),
             )
             .unwrap(),
         );
@@ -1281,4 +1300,125 @@ async fn global_migration_preserves_both_ipv4_and_ipv6_socket_owners() {
     assert_eq!(node.factory.xudp_snapshot().associations, 1);
     drop(new);
     node.close().await;
+}
+
+#[tokio::test]
+async fn geodata_refresh_is_transactional_and_changed_rules_revoke_existing_sessions() {
+    use prost::Message;
+    #[derive(Clone, PartialEq, Message)]
+    struct List {
+        #[prost(message, repeated, tag = "1")]
+        entries: Vec<Entry>,
+    }
+    #[derive(Clone, PartialEq, Message)]
+    struct Entry {
+        #[prost(string, tag = "1")]
+        code: String,
+        #[prost(message, repeated, tag = "2")]
+        cidrs: Vec<Cidr>,
+    }
+    #[derive(Clone, PartialEq, Message)]
+    struct Cidr {
+        #[prost(bytes, tag = "1")]
+        ip: Vec<u8>,
+        #[prost(uint32, tag = "2")]
+        prefix: u32,
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("geoip.dat");
+    let encode = |ip| {
+        List {
+            entries: vec![Entry {
+                code: "TEST".into(),
+                cidrs: vec![Cidr {
+                    ip: vec![ip, 0, 0, 0],
+                    prefix: 8,
+                }],
+            }],
+        }
+        .encode_to_vec()
+    };
+    std::fs::write(&path, encode(10)).unwrap();
+    let node = Node::with_network(
+        |v| v["data"]["block"] = json!(["geoip:test"]),
+        users(),
+        vless::Options {
+            listen: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            ..Default::default()
+        },
+        terraris::dns::Settings::default(),
+        terraris::route::Settings {
+            geoip: Some(path.clone()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let (address, echo) = echo().await;
+    let target = Some(Address::from_socket(address).unwrap());
+    let mut client = node
+        .connect(UUID1, wire::Command::Tcp, target.clone())
+        .await;
+    let generation = node.supervisor.snapshot().generation;
+    let mut same = config(node.address);
+    same["data"]["block"] = json!(["geoip:test"]);
+    std::fs::write(&path, [0]).unwrap();
+    node.panel.push(Reply::json(same.clone()));
+    assert!(node.supervisor.sync_config(&ctx()).await.is_err());
+    assert_eq!(node.supervisor.snapshot().generation, generation);
+    exchange(&mut client, b"retained").await;
+    std::fs::write(&path, encode(127)).unwrap();
+    node.panel.push(Reply::json(same));
+    node.panel.push(Reply::json(users()));
+    node.supervisor.sync_config(&ctx()).await.unwrap();
+    assert_ne!(node.supervisor.snapshot().generation, generation);
+    let mut byte = [0];
+    let closed = tokio::time::timeout(Duration::from_secs(3), client.read(&mut byte))
+        .await
+        .unwrap();
+    assert!(closed.is_err() || closed.unwrap() == 0);
+    drop(client);
+    std::fs::remove_file(&path).unwrap();
+    node.panel.push(Reply::json(config(node.address)));
+    node.panel.push(Reply::json(users()));
+    node.supervisor.sync_config(&ctx()).await.unwrap();
+    let mut client = node.connect(UUID1, wire::Command::Tcp, target).await;
+    exchange(&mut client, b"replacement").await;
+    drop(client);
+    node.close().await;
+    echo.abort();
+    echo.await.ok();
+}
+
+#[tokio::test]
+async fn changed_policy_revokes_sessions_from_every_draining_generation() {
+    let node = Node::new(|_| {}, users()).await;
+    let (address, echo) = echo().await;
+    let target = Some(Address::from_socket(address).unwrap());
+    let mut oldest = node
+        .connect(UUID1, wire::Command::Tcp, target.clone())
+        .await;
+    let mut compatible = config(node.address);
+    compatible["data"]["traffic_report_threshold"] = json!(2048);
+    node.panel.push(Reply::json(compatible));
+    node.panel.push(Reply::json(users()));
+    node.supervisor.sync_config(&ctx()).await.unwrap();
+    let mut previous = node.connect(UUID1, wire::Command::Tcp, target).await;
+    exchange(&mut oldest, b"draining").await;
+    let mut blocked = config(node.address);
+    blocked["data"]["block"] = json!(["127.0.0.0/8"]);
+    node.panel.push(Reply::json(blocked));
+    node.panel.push(Reply::json(users()));
+    node.supervisor.sync_config(&ctx()).await.unwrap();
+    for stream in [&mut oldest, &mut previous] {
+        let mut bytes = [0];
+        let result = tokio::time::timeout(Duration::from_millis(500), stream.read(&mut bytes))
+            .await
+            .unwrap();
+        assert!(result.is_err() || result.unwrap() == 0);
+    }
+    drop(oldest);
+    drop(previous);
+    node.close().await;
+    echo.abort();
+    echo.await.ok();
 }

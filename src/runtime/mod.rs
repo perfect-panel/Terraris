@@ -110,6 +110,16 @@ pub trait ProtocolDriver: users::AuthUpdater + Send + Sync {
 
 #[async_trait]
 pub trait SharedServices: Send + Sync + 'static {
+    fn reload_required(&self) -> Result<bool, Error> {
+        Ok(false)
+    }
+    fn invalidates(&self, _next: &Self) -> bool
+    where
+        Self: Sized,
+    {
+        false
+    }
+
     /// Both abort and close must be idempotent; close may be retried after cancellation.
     fn abort(&self);
     async fn close(&self, context: &OperationContext) -> Result<(), Error>;
@@ -131,6 +141,9 @@ pub trait RuntimeFactory: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Called after publication and outside the publication lock. Infallible
+    /// cleanup can revoke retained state that is incompatible with new policy.
+    fn published(&self, _shared: &Self::Shared) {}
     fn supports(&self, protocol: &ProtocolName) -> bool;
     /// Validate and compile all non-default shared DNS/routing/outbound fields.
     /// Returning success while silently ignoring unsupported policy is invalid.

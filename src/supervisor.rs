@@ -412,22 +412,39 @@ impl<F: RuntimeFactory> Supervisor<F> {
             .map_err(Error::Stopped)?
             .map_err(Error::Panel)?;
         context.check().map_err(Error::Stopped)?;
+        let active = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .active
+            .clone();
+        // A replacement configuration may intentionally remove an unavailable asset.
+        let replaces = matches!(&response, Fetch::Changed{value,..} if self.state.lock().unwrap_or_else(|e|e.into_inner()).config.as_ref().is_none_or(|current|**current != *value));
+        let refresh = active
+            .as_ref()
+            .filter(|_| !replaces)
+            .map(|active| active.shared.0.reload_required())
+            .transpose()
+            .map_err(Error::Runtime)?
+            .unwrap_or(false);
         let (config, validator) = match response {
             Fetch::Unchanged { validator } => {
-                let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                if s.config.is_none() {
-                    return Err(Error::MissingConfig);
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                let config = state.config.clone().ok_or(Error::MissingConfig)?;
+                if !refresh {
+                    state.validator = Some(validator);
+                    return Ok(SyncOutcome::Unchanged);
                 }
-                s.validator = Some(validator);
-                return Ok(SyncOutcome::Unchanged);
+                (config, validator)
             }
             Fetch::Changed { value, validator } => (Arc::new(value), validator),
         };
         let (id, mut scopes, previous) = {
             let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            if s.config
-                .as_ref()
-                .is_some_and(|current| **current == *config)
+            if !refresh
+                && s.config
+                    .as_ref()
+                    .is_some_and(|current| **current == *config)
             {
                 s.validator = Some(validator);
                 return Ok(SyncOutcome::Unchanged);
@@ -570,16 +587,23 @@ impl<F: RuntimeFactory> Supervisor<F> {
                 .await;
             return Err(error);
         }
+        self.factory.published(candidate.shared.0.as_ref());
         // Wakes and listener stop happen outside the publication lock. The new
         // maintenance task waits until its predecessor's futures are dropped.
-        let old = self
+        let retired = self
             .state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retired
-            .last()
-            .cloned();
-        if let Some(old) = old {
+            .clone();
+        for old in &retired {
+            if old.shared.0.invalidates(candidate.shared.0.as_ref()) {
+                for runtime in old.runtimes.values() {
+                    runtime.core().abort();
+                }
+            }
+        }
+        if let Some(old) = retired.last() {
             old.retire(self.options.drain_timeout);
         }
         if let Some(m) = &candidate.maintenance {
