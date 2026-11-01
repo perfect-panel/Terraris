@@ -1,6 +1,6 @@
 # Terraris 架构设计
 
-状态：架构基线。日期：2026-11-01。Rust 基础工程和 PPanel 接口层已实现，当前能力及运行方式见 [README](../README.md)。本文中的协议运行时、更新生命周期和运维默认值仍是后续实现方案，不代表已经部署验证。
+状态：架构基线。日期：2026-11-01。Rust 基础工程、PPanel 接口层及 B1 的 resource/buffer 已实现，当前能力见 [README](../README.md)。后续继续[基础设施](infrastructure.md)和 [Buffer 系统](buffer.md)的共享、缓存与 I/O 能力，再实现用户及控制面运行时。协议运行时、更新生命周期和运维默认值仍是后续方案，不代表已经部署验证。
 
 Terraris 以 Polaris 的实际模块和生命周期为架构基线：`panel` 隔离面板协议，`supervisor` 管服务器配置代次，`controller` 管单协议用户与维护任务，`protocol::runtimekit` 统一运行时装配，`protocol::flow` 统一数据面策略。通过 Rust 的所有权、类型和异步任务模型实现这些边界。
 
@@ -49,11 +49,14 @@ TCP 字节流和 UDP 数据报分别建模。QUIC 流可以交付字节流接口
 
 初期使用一个 Cargo package，包含二进制入口和可测试的内部模块，模块命名与 Polaris 对齐。现成 Rust 协议引擎以依赖引入；需要自研且可独立复用的引擎再单独拆 crate。crate 数量不决定架构分层，跨模块依赖规则从第一版生效。
 
-以下是目标模块划分；当前已实现 `app`、`config`、`panel` 及 PPanel/HTTP 适配，其他模块随运行时阶段引入，不建立空实现：
+以下是目标模块划分；当前已实现 `app`、`config`、`panel` 及 resource/buffer 的 B1 能力，其他模块按基础设施和运行时阶段引入，不建立空实现：
 
 | 拟定 Rust 模块 | 职责 | Polaris 对应位置 |
 | --- | --- | --- |
 | `app` / `config` | CLI、本地配置、依赖装配、信号和退出 | `cmd`、本地配置入口 |
+| `resource` / `buffer` | 受管理容量、作用域许可、拥有者、共享视图与受限缓存池 | 参考 sing buffer、XHTTP holder 及数据面资源约束，以 Rust 实现 |
+| `task` / `time` | 取消传播、任务回收、单调截止时间与可测试时间 | 参考 context、scheduler 的生命周期约束 |
+| `network` / `codec` | 地址与包元数据、流/数据报端口、有界编码辅助 | 参考 sing metadata/network/bufio，不搬入 Go 类型 |
 | `panel` | 面板中立的端口、规范化模型、Validator 和策略 | `internal/panel` |
 | `panel::ppanel` | PPanel DTO、鉴权、业务响应和显式转换 | `internal/panel/ppanel` |
 | `panel::http` | HTTP 连接池、路径前缀、超时、限长与脱敏 | `internal/panel/internal/httpapi` |
@@ -99,6 +102,8 @@ TCP 字节流和 UDP 数据报分别建模。QUIC 流可以交付字节流接口
 
 `runtimekit::Core` 装配共享 Egress 引用、Counter、Limiter、SessionRegistry 与 AdmissionGate。`runtimekit::Runtime` 组合 Core、Controller 和协议 Server，并提供统一生命周期。单协议适配器不再复制轮询、关闭、排空和报告循环。
 
+Core 还必须接收受预算控制的 buffer 分配接口和任务作用域。协议适配器不能私建无界内存池或无主后台任务；这些基础设施先按 [实施顺序](infrastructure.md)落地，再接 RuntimeKit。测试也要显式提供预算，不能用默认无限资源掩盖生命周期错误。
+
 `runtimekit::Lifecycle` 统一能接管 socket 的协议服务器；QUIC 或外部库自行持有 Endpoint 时，实现相同的生命周期端口，明确其排空能力。不能为统一类型而假定每个库都能交出底层监听器。
 
 Server 的认证读取与 `PreparedUsers` 提交必须通过同一发布机制协调。Rust 中优先替换完整的不可变认证快照；必须调用可变库 API 时，用短提交区保护，禁止握手 I/O 持锁等待。
@@ -127,17 +132,19 @@ Server 的认证读取与 `PreparedUsers` 提交必须通过同一发布机制�
 
 | 寿命 | 所有者和资源 | 释放条件 |
 | --- | --- | --- |
-| 进程 | App 持有 PanelConnection、全局设备租约服务、持久化队列和协议作用域索引 | 所有活跃及退役代次关闭后 |
+| 进程 | App 持有 PanelConnection、资源预算、BufferPool、全局设备租约服务、持久化队列和协议作用域索引 | 所有活跃及退役代次关闭后；共享 buffer 的最后拥有者负责释放其分配 |
 | 协议作用域 | Supervisor 保留 UserStore、Counter、Limiter、SessionRegistry 的稳定身份；同作用域最多一个维护任务所有者 | 无活跃或退役运行时引用；待上报数据另行保留 |
 | 配置代次 | Generation 持有共享 Egress、DNS/路由快照、准入门、运行时集合和维护计划 | 所有该代次会话、运行时结束后，最后释放共享出口 |
 | 单协议运行时 | Runtime 持有 Controller、Server、监听器及任务句柄，借用稳定的协议状态和代次资源 | StopAccepting、Drain、Close 完成后 |
-| 单连接或会话 | 会话许可持有取消句柄、来源 IP 引用、上下游和计数句柄 | 结束、撤销或强制关闭，且只释放一次 |
+| 单连接或会话 | 会话许可持有取消句柄、来源 IP 引用、上下游、BufferScope 和计数句柄 | 结束、撤销或强制关闭；buffer 配额在最后保留视图释放后归还 |
 
 Polaris 已将协议 Counter 保留在 Supervisor 中并跨代次注入。Terraris 将稳定身份延伸到用户、限速和会话注册服务，使旧连接排空期间仍受当前用户撤销和限速约束；这是明确的设计扩展，不声称 Polaris 已采用同样的全部状态布局。
 
 候选准备只能构造私有快照，不得提前修改共享 UserStore、限速桶或设备状态。跨代次提交用统一发布门协调；替换协议对象不销毁待上报流量。Rust 的 `Drop` 负责同步资源释放和取消兜底，等待任务、刷新队列仍通过显式异步 `close` 完成。
 
 关闭旧 Runtime 只取消自己的任务、关闭自己的会话并释放借用句柄，不清空新代次仍在使用的 UserStore、Limiter 或 Registry，也不启动第二个 Reporter。维护任务交接使用作用域所有者标识，已失去所有权的旧任务不能提交迟到结果。
+
+新旧代次共享进程级资源上限，重载不能给候选重新发放一份完整内存预算。旧连接或排队视图继续保留的分配仍计量，直到真正释放；BufferPool 不随单个协议运行时销毁。
 
 热路径优先使用不可变共享数据、分片计数器和短临界区。异步 I/O 通过有界队列交给状态所有者；不跨 `.await` 持有用户、会话或流量映射的锁。这与 [Tokio 的共享状态指导](https://tokio.rs/tokio/tutorial/shared-state)一致。
 
@@ -338,13 +345,15 @@ SS2022 库的 `set_user_manager` 提供 EIH 多用户入口，但这不足以证
 | --- | --- | --- |
 | M0 架构设计 | Polaris 架构映射与 PPanel 接口契约 | 已完成模块、端口和状态所有权设计 |
 | M1a 基础工程与面板接口 | Rust 工程、PanelConnection、完整 PPanel 客户端、只读检查 CLI | 已通过本地 JSON/Protobuf 契约测试及 Go 编码样本互操作；真实部署联调待完成 |
-| M1b 控制面与协议可行性 | Supervisor/Controller、RuntimeKit、模拟运行时、SS2022 适配原型 | 后续实现；候选失败不开放代次准入、不推进验证器；协议多用户与热更新接口可用 |
+| M1b 基础设施与 Buffer | resource、buffer、task/time、network/codec、基础 dataplane 与指标 | B1 的分级预算、独占 buffer、批量回滚及测试已完成；共享/缓存、调度与完整 I/O 继续推进 |
+| M1c 控制面与协议可行性 | scheduler、users、Supervisor/Controller、RuntimeKit、模拟运行时和 SS2022 适配原型 | 复用 M1b；候选失败不开放代次准入、不推进验证器；协议多用户与热更新接口可用 |
 | M2 首个代理闭环 | SS2022 TCP/UDP、用户快照、流处理、限速与设备准入 | 真实兼容客户端互通；用户撤销取消在途拨号；跨节点竞争同一设备名额不超限 |
 | M3 生产运行基础 | 持久化上报、更新恢复、退出与服务包装 | 响应丢失、重启恢复、存储失败、证书替换、长期离线、负载与资源限额测试 |
 | M4 协议扩展 | 按能力矩阵逐项增加协议 | 每个协议沿用 M2/M3 的策略与故障测试，增加独立互通用例 |
 
-当前测试覆盖面板接口、HTTP 行为和 CLI。后续运行时阶段至少覆盖以下具有业务意义的场景：
+当前测试覆盖面板接口、HTTP/CLI，以及 resource/buffer 的容量、所有权和失败回收。后续阶段至少覆盖以下具有业务意义的场景：
 
+- buffer 和队列预算不超限，共享视图不提前回池，取消/关闭并发恰好回收一次；重载不重置总预算。
 - 同一订阅多连接和双向流量共享速率；增加连接不会突破总限制。
 - 相同 IP 跨节点和协议去重；两个新 IP 同时争夺最后一个名额只有一个成功。
 - 用户在握手、设备申请、DNS、拨号、转发各阶段被撤销后无法继续使用。

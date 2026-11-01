@@ -2,10 +2,12 @@
 
 Terraris 是参考 Polaris 架构设计的 PPanel Rust 节点端项目，负责代理协议接入、用户认证、限速与设备准入，以及节点状态、在线设备和流量上报。
 
-当前已完成 Rust 基础工程和 PPanel 面板客户端。代理协议、Supervisor/Controller 运行循环、限速执行及持久化上报尚未实现；当前二进制用于配置与只读联通检查，不监听代理端口或自动上报在线状态。
+当前已完成 Rust 基础工程、PPanel 面板客户端，以及 B1 的 resource/buffer 底层模块。代理协议、Supervisor/Controller 运行循环、限速执行及持久化上报尚未实现；当前二进制用于配置与只读联通检查，不监听代理端口或自动上报在线状态。
 
 - [架构设计](docs/architecture.md)：模块边界、状态管理、协议规划、故障处理与实施阶段。
 - [PPanel 接口契约](docs/ppanel-api.md)：当前 backend 的实际接口、身份与计量语义、兼容性要求。
+- [基础设施顺序](docs/infrastructure.md)：先完成资源、任务、buffer 和基础 I/O，再接控制面运行时。
+- [Buffer 系统设计](docs/buffer.md)：所有权、前后预留空间、共享切片、内存预算、池化和背压。
 
 设计沿用 Polaris 的 `panel → supervisor/controller → protocol` 分层，以 `runtimekit` 统一运行时生命周期、以 `flow` 统一数据面策略。采用单进程、多协议结构，优先面向 Linux x86_64 和 aarch64。Rust 负责节点控制与协议集成；候选协议库必须能接入统一的用户策略、连接管理和流量计量。
 
@@ -18,8 +20,24 @@ Terraris 是参考 Polaris 架构设计的 PPanel Rust 节点端项目，负责�
 - 调用方持有的 ETag / 内容指纹；区分 304、成功空列表、请求失败，隔离连接、协议和编码的缓存。
 - API 路径前缀、请求超时、请求与响应大小限制；禁用自动重定向及 HTTP 自动重试；错误不保留 URL query、远端消息或响应体。
 - 订阅 ID 保持 int64 精度，规范化 Hysteria 协议名和 IPv4-mapped 地址，按协议读取当前证书指纹。
+- resource 支持进程/多级作用域的字节与分配数量上限、原子批量预留、Reserved/Resident 快照、RAII 归还及关闭语义。
+- buffer 提供受检 BufferLayout、独占 BufferLease、固定容量封包、清零 padding、受限读取及批量分配失败回滚。当前没有缓存池、共享切片或异步额度等待。
 
 设备租约、用户限制和流量接口目前由 library 暴露；这不代表已经有数据面执行这些策略。
+
+## Resource 和 Buffer 使用约定
+
+创建 `resource::Budget`，通过 `scope` / `child` 派生连接或子流配额，再将作用域交给 `buffer::BufferScope`。具体用法见两个模块的 Rustdoc 示例，可用 `cargo doc --no-deps` 查看。
+
+- `Limits` 同时限制字节和分配名额；零长度 buffer 也占一个名额。子作用域上限不得大于父级，最大嵌套深度为 32。
+- `try_reserve_many` 在同一作用域一次性预留所有请求，进程和每一级祖先都参与检查；它返回独立的 Reservation，消费 `commit()` 后成为 Permit。未提交或已提交许可都通过 Drop 自动归还。
+- `try_lease_many` 在分配任何 payload 存储前取得整批预算，后续分配失败时回收已分配块和剩余预留，调用方不会得到半个批次。
+- `BufferLayout` 为 headroom + payload capacity + tailroom 的精确大小，B1 不向上取整到缓存类别。预算按完整分配计量，不随 readable length 缩小。
+- payload 不能占用 trailer 预留；添加 trailer 后 payload 封口。consume/truncate 后要先 clear 才能重新封包。clear 清空逻辑范围，不释放容量，也不承诺安全擦除。
+- `read_from` 只提交成功读取的 filled 字节；空间耗尽是错误，不会冒充 EOF。取消持有 buffer 的任务后，等待其结束才能确认资源已经归还。
+- close 阻止新的预留和子作用域，不撤销现有拥有者；关闭前取得的 Reservation 仍可提交。取消任务与强制结束由后续 TaskGroup 层负责。
+
+当前预算约束的是受管理存储容量及分配名额，不能当作进程 RSS 上限。元数据、分配器开销和外部网络库内存不在字节口径内。批量预留只覆盖同一个作用域，跨分支组合预留尚未提供。
 
 ## 构建与本地检查
 
@@ -65,10 +83,13 @@ cargo run --locked -- check --config examples/terraris.toml
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
+cargo test --locked --doc
 cargo build --locked --release
 ```
 
 测试使用本地 HTTP 模拟面板，覆盖全部端点、两种编码、条件请求、大小限制、取消、错误脱敏及报告不重试。另有[使用 backend Go 绑定生成的互操作样本](tests/fixtures/README.md)，正常 Rust 测试无需 Go。
+
+资源和 buffer 测试覆盖作用域聚合、并发批次争用、close/申请竞态、取消回收、零长度名额、溢出、封包边界，以及后续分配失败和 unwind 时的整批回滚。Rustdoc 还验证 BufferLease 无法 Clone。
 
 [CI 配置](.github/workflows/ci.yml) 在 Linux 和 macOS 上执行格式、Clippy、测试及 release 构建。当前本地验证不等于生产面板、Redis/PostgreSQL 或 Linux 部署联调。
 
