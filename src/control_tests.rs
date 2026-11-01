@@ -1277,3 +1277,45 @@ async fn denied_device_never_registers_online_or_leaves_counter_slots() {
     assert_eq!(core.reports().snapshot().traffic_users, 0);
     assert_eq!(core.reports().snapshot().online_ips, 0);
 }
+
+#[tokio::test(start_paused = true)]
+async fn identity_hashes_include_store_scope_and_authentication_epoch() {
+    let h = Harness::new(&["alpha", "beta"]);
+    h.sync().await;
+    let first = h
+        .runtime("alpha")
+        .core()
+        .users()
+        .view()
+        .snapshot
+        .authenticate("first")
+        .unwrap();
+    let second = h
+        .runtime("beta")
+        .core()
+        .users()
+        .view()
+        .snapshot
+        .authenticate("first")
+        .unwrap();
+    assert_ne!(first, second);
+    let mut identities = std::collections::HashSet::from([first.clone(), second]);
+    assert_eq!(identities.len(), 2);
+    h.panel.users(vec![user(1, "changed")]);
+    h.runtime("alpha")
+        .controller
+        .sync_users(&ctx())
+        .await
+        .unwrap();
+    let next = h
+        .runtime("alpha")
+        .core()
+        .users()
+        .view()
+        .snapshot
+        .authenticate("changed")
+        .unwrap();
+    assert_ne!(first, next);
+    identities.insert(next);
+    assert_eq!(identities.len(), 3);
+}

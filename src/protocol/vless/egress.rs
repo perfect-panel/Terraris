@@ -70,6 +70,15 @@ pub struct Egress {
     cancel: CancellationToken,
 }
 impl Egress {
+    pub(super) fn migration_scope(&self) -> u8 {
+        match self.strategy {
+            Strategy::Any => 0,
+            Strategy::PreferV4 => 1,
+            Strategy::PreferV6 => 2,
+            Strategy::V4 => 3,
+            Strategy::V6 => 4,
+        }
+    }
     pub(super) fn new(config: &ServerConfig) -> Result<Self, runtime::Error> {
         let active = config
             .protocols

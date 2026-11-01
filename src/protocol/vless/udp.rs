@@ -5,13 +5,12 @@ use super::{
     wire, xudp,
 };
 use crate::{
-    buffer::{BufferScope, QueueItem, QueueLimits, SharedBuffer, bounded_queue},
-    network::{Address, Datagram, DatagramEndpoint},
+    buffer::{BufferScope, QueueLimits, bounded_queue},
+    network::{Address, DatagramEndpoint},
     protocol::flow::{Error, Session},
     time::{Deadline, OperationContext},
     users::Identity,
 };
-use futures_util::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use std::{
     collections::BTreeMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -97,37 +96,7 @@ pub(super) async fn standard(
     }
 }
 struct StreamState {
-    sequence: u64,
-    session: Arc<Session>,
-    context: OperationContext,
-    target: Address,
-    sockets: BTreeMap<bool, DatagramEndpoint>,
-    last: tokio::time::Instant,
-}
-impl Drop for StreamState {
-    fn drop(&mut self) {
-        self.context.cancellation().cancel();
-    }
-}
-struct Output {
-    metadata: xudp::Metadata,
-    payload: Option<SharedBuffer>,
-    session: Arc<Session>,
-    valid: OperationContext,
-}
-impl QueueItem for Output {
-    fn queue_bytes(&self) -> usize {
-        self.payload.as_ref().map_or(0, SharedBuffer::len)
-    }
-}
-type Received = BoxFuture<'static, (u16, u64, Result<Datagram, crate::network::Error>)>;
-fn receive(
-    id: u16,
-    sequence: u64,
-    socket: DatagramEndpoint,
-    context: OperationContext,
-) -> Received {
-    async move { (id, sequence, socket.recv(&context).await) }.boxed()
+    lease: super::associations::Lease,
 }
 pub(super) async fn multiplex(
     driver: &Driver,
@@ -137,13 +106,14 @@ pub(super) async fn multiplex(
     carrier: Arc<Session>,
     buffers: BufferScope,
 ) -> Result<(), Error> {
+    use super::associations::{Carrier, Output};
     carrier
         .run(wire::write_response(&mut stream))
         .await?
         .map_err(|_| Error::Io(std::io::ErrorKind::BrokenPipe))?;
     let (read, write) = tokio::io::split(stream);
     let mut reader =
-        xudp::Reader::new(read, buffers.clone(), MAX_PACKET).map_err(|_| Error::InvalidOptions)?;
+        xudp::Reader::new(read, buffers, MAX_PACKET).map_err(|_| Error::InvalidOptions)?;
     let limits = QueueLimits::new(
         driver.options.queue_packets * MAX_PACKET,
         driver.options.queue_packets,
@@ -151,91 +121,234 @@ pub(super) async fn multiplex(
     )
     .map_err(|_| Error::InvalidOptions)?;
     let (sender, queue) = bounded_queue(limits).map_err(|_| Error::InvalidOptions)?;
+    let routes = Carrier::new();
     let writer = write_outputs(write, queue, carrier.clone());
     let manager = async {
         let mut streams: BTreeMap<u16, StreamState> = BTreeMap::new();
-        let mut reads: FuturesUnordered<Received> = FuturesUnordered::new();
-        let mut sequence = 0u64;
-        let mut idle = tokio::time::Instant::now();
+        let mut serial = 0u64;
         loop {
-            let context = carrier.context();
-            let next_idle = streams
-                .values()
-                .map(|s| s.last + driver.options.udp_idle_timeout)
-                .min()
-                .unwrap_or(idle + driver.options.udp_idle_timeout);
-            tokio::select! {
-                _=tokio::time::sleep_until(next_idle)=>{let now=tokio::time::Instant::now();streams.retain(|_,state|now.duration_since(state.last)<driver.options.udp_idle_timeout);if streams.is_empty()&&now.duration_since(idle)>=driver.options.udp_idle_timeout{return Ok(());}}
-                event=reads.next(),if !reads.is_empty()=>{
-                    let(id,sequence,result)=event.expect("receive future");let Some(state)=streams.get_mut(&id).filter(|s|s.sequence==sequence)else{continue;};
-                    let packet=match result{Ok(packet)=>packet,Err(_)=>{streams.remove(&id);continue;}};state.session.check()?;state.last=tokio::time::Instant::now();idle=state.last;
-                    let family=packet.local_addr.is_ipv6();let socket=state.sockets[&family].clone();reads.push(receive(id,sequence,socket,state.context.clone()));
-                    let metadata=xudp::Metadata{id,status:xudp::Status::Keep,data:true,error:false,target:Some(Address::from_socket(packet.source).map_err(|_|Error::Resolve)?),global_id:None};
-                    // UDP backpressure drops a complete unbilled packet when full.
-                    let _=sender.try_send(Output{metadata,payload:Some(packet.payload),session:state.session.clone(),valid:state.context.clone()});
+            tokio::task::yield_now().await;
+            streams.retain(|_, stream| stream.lease.valid());
+            let idle = routes.last() + driver.options.udp_idle_timeout;
+            let frame = tokio::select! {
+                _=tokio::time::sleep_until(idle)=>{if routes.last().elapsed()>=driver.options.udp_idle_timeout{return Ok(());}continue;}
+                frame=reader.next()=>frame.map_err(|_|Error::Io(std::io::ErrorKind::InvalidData))?
+            };
+            let Some(frame) = frame else {
+                return Ok(());
+            };
+            let id = frame.metadata.id;
+            routes.touch();
+            match frame.metadata.status {
+                xudp::Status::KeepAlive => continue,
+                xudp::Status::End => {
+                    streams.remove(&id);
+                    continue;
                 }
-                frame=reader.next()=>{
-                    let Some(frame)=frame.map_err(|_|Error::Io(std::io::ErrorKind::InvalidData))?else{return Ok(());};let id=frame.metadata.id;idle=tokio::time::Instant::now();
-                    match frame.metadata.status{
-                        xudp::Status::KeepAlive=>continue,
-                        xudp::Status::End=>{streams.remove(&id);continue;}
-                        xudp::Status::New=>{
-                            let duplicate=streams.remove(&id).is_some();
-                            if duplicate||streams.len()>=driver.options.max_xudp_sessions||reads.len()>=driver.options.max_xudp_sessions*2{
-                                sender.try_send(Output{metadata:end(id),payload:None,session:carrier.clone(),valid:carrier.context()}).map_err(|_|Error::Capacity)?;continue;
-                            }
-                            let session=match carrier.run(driver.policies.admit(&driver.core,identity,source,driver.client.clone())).await?{Ok(session)=>session,Err(_)=>{sender.try_send(Output{metadata:end(id),payload:None,session:carrier.clone(),valid:carrier.context()}).map_err(|_|Error::Capacity)?;continue;}};
-                            sequence=sequence.checked_add(1).ok_or(Error::Capacity)?;let context=session.context().child();streams.insert(id,StreamState{sequence,context,session,target:frame.metadata.target.clone().ok_or(Error::Resolve)?,sockets:BTreeMap::new(),last:idle});
-                        }
-                        xudp::Status::Keep=>{}
+                xudp::Status::New => {
+                    let duplicate = streams.remove(&id).is_some();
+                    serial = serial.checked_add(1).ok_or(Error::Capacity)?;
+                    if duplicate || streams.len() >= driver.options.max_xudp_sessions {
+                        sender
+                            .try_send(Output::End {
+                                id,
+                                serial,
+                                carrier: routes.clone(),
+                                error: true,
+                            })
+                            .map_err(|_| Error::Capacity)?;
+                        continue;
                     }
-                    if frame.metadata.error{streams.remove(&id);continue;}
-                    let Some(state)=streams.get_mut(&id)else{sender.try_send(Output{metadata:end(id),payload:None,session:carrier.clone(),valid:carrier.context()}).map_err(|_|Error::Capacity)?;continue;};
-                    let Some(payload)=frame.payload else{continue;};state.session.check()?;let address=frame.metadata.target.as_ref().unwrap_or(&state.target);let destination=target(driver,address,&state.session).await?;let family=destination.is_ipv6();
-                    if let std::collections::btree_map::Entry::Vacant(entry)=state.sockets.entry(family){let socket=endpoint(driver,destination,buffers.clone(),&state.session).await?;reads.push(receive(id,state.sequence,socket.clone(),state.context.clone()));entry.insert(socket);}
-                    send(&state.sockets[&family],destination,payload.as_slice(),&state.session,&context).await?;state.last=tokio::time::Instant::now();
+                    let session = match carrier
+                        .run(driver.policies.admit(
+                            &driver.core,
+                            identity,
+                            source,
+                            driver.client.clone(),
+                        ))
+                        .await?
+                    {
+                        Ok(session) => session,
+                        Err(_) => {
+                            sender
+                                .try_send(Output::End {
+                                    id,
+                                    serial,
+                                    carrier: routes.clone(),
+                                    error: true,
+                                })
+                                .map_err(|_| Error::Capacity)?;
+                            continue;
+                        }
+                    };
+                    let target = frame.metadata.target.clone().ok_or(Error::Resolve)?;
+                    routes.install(id, serial);
+                    match driver.associations.attach(
+                        &driver.core,
+                        identity,
+                        driver.egress.migration_scope(),
+                        frame.metadata.global_id,
+                        id,
+                        serial,
+                        target,
+                        session,
+                        sender.clone(),
+                        routes.clone(),
+                    ) {
+                        Ok(lease) => {
+                            streams.insert(id, StreamState { lease });
+                        }
+                        Err(_) => {
+                            routes.remove(id, serial);
+                            sender
+                                .try_send(Output::End {
+                                    id,
+                                    serial,
+                                    carrier: routes.clone(),
+                                    error: true,
+                                })
+                                .map_err(|_| Error::Capacity)?;
+                            continue;
+                        }
+                    }
                 }
+                xudp::Status::Keep => {}
+            }
+            if frame.metadata.error {
+                streams.remove(&id);
+                continue;
+            }
+            let Some(state) = streams.get(&id) else {
+                sender
+                    .try_send(Output::End {
+                        id,
+                        serial,
+                        carrier: routes.clone(),
+                        error: true,
+                    })
+                    .map_err(|_| Error::Capacity)?;
+                continue;
+            };
+            let Some(payload) = frame.payload else {
+                continue;
+            };
+            let address = frame
+                .metadata
+                .target
+                .as_ref()
+                .unwrap_or(&state.lease.target);
+            let operation = async {
+                let destination = target(driver, address, &state.lease.binding.session).await?;
+                state.lease.send(destination, payload.as_slice()).await
+            };
+            let result = state.lease.binding.context.run(operation).await;
+            if !matches!(result, Ok(Ok(()))) {
+                streams.remove(&id);
+                sender
+                    .try_send(Output::End {
+                        id,
+                        serial,
+                        carrier: routes.clone(),
+                        error: true,
+                    })
+                    .map_err(|_| Error::Capacity)?;
             }
         }
     };
     tokio::pin!(manager, writer);
     tokio::select! {result=&mut manager=>result,result=&mut writer=>result}
 }
-fn end(id: u16) -> xudp::Metadata {
-    xudp::Metadata {
-        id,
-        status: xudp::Status::End,
-        data: false,
-        error: true,
-        target: None,
-        global_id: None,
-    }
-}
 async fn write_outputs<W: AsyncWrite + Unpin>(
     mut writer: W,
-    mut queue: crate::buffer::BufferQueue<Output>,
+    mut queue: crate::buffer::BufferQueue<super::associations::Output>,
     carrier: Arc<Session>,
 ) -> Result<(), Error> {
+    use super::associations::Output;
     while let Some(output) = carrier.run(queue.recv()).await? {
-        if output.valid.check().is_err() {
-            continue;
+        match output {
+            Output::End {
+                id,
+                serial,
+                carrier: routes,
+                error,
+            } => {
+                if !routes.matches(id, serial) {
+                    continue;
+                }
+                let metadata = xudp::Metadata {
+                    id,
+                    status: xudp::Status::End,
+                    data: false,
+                    error,
+                    target: None,
+                    global_id: None,
+                };
+                carrier
+                    .run(xudp::write(&mut writer, &metadata, None))
+                    .await?
+                    .map_err(|_| Error::Io(std::io::ErrorKind::BrokenPipe))?;
+            }
+            Output::Data {
+                packet,
+                binding,
+                entry,
+            } => {
+                if binding.context.check().is_err() {
+                    if let Some(entry) = entry.upgrade() {
+                        entry.deliver(packet);
+                    }
+                    continue;
+                }
+                let mut started = false;
+                let n = packet.payload.len();
+                let result = binding
+                    .context
+                    .run(async {
+                        let mut quota = binding.session.quota(n).await?;
+                        let mut counter = binding.session.reserve(false, n)?;
+                        let metadata = xudp::Metadata {
+                            id: binding.id,
+                            status: xudp::Status::Keep,
+                            data: true,
+                            error: false,
+                            target: Some(
+                                Address::from_socket(packet.source).map_err(|_| Error::Resolve)?,
+                            ),
+                            global_id: None,
+                        };
+                        started = true;
+                        carrier
+                            .run(xudp::write_progress(
+                                &mut writer,
+                                &metadata,
+                                Some(packet.payload.as_slice()),
+                                |written| quota.commit(written),
+                            ))
+                            .await?
+                            .map_err(|_| Error::Io(std::io::ErrorKind::BrokenPipe))?;
+                        counter.commit(n as u64);
+                        Ok(())
+                    })
+                    .await;
+                match result {
+                    Ok(Ok(())) => {
+                        carrier
+                            .run(writer.flush())
+                            .await?
+                            .map_err(|e| Error::Io(e.kind()))?;
+                    }
+                    Err(_) => {
+                        if let Some(entry) = entry.upgrade() {
+                            entry.deliver(packet);
+                        }
+                        if started {
+                            return Err(Error::Stopped);
+                        }
+                    }
+                    Ok(Err(error)) => return Err(error),
+                }
+            }
         }
-        let n = output.payload.as_ref().map_or(0, SharedBuffer::len);
-        let mut quota = output.session.quota(n).await?;
-        if output.valid.check().is_err() {
-            continue;
-        }
-        let mut count = output.session.reserve(false, n)?;
-        carrier
-            .run(xudp::write(
-                &mut writer,
-                &output.metadata,
-                output.payload.as_ref().map(SharedBuffer::as_slice),
-            ))
-            .await?
-            .map_err(|_| Error::Io(std::io::ErrorKind::BrokenPipe))?;
-        quota.commit(n);
-        count.commit(n as u64);
     }
     Ok(())
 }

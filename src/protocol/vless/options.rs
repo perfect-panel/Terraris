@@ -17,6 +17,9 @@ pub struct Options {
     pub udp_idle_timeout: Duration,
     pub max_xudp_sessions: usize,
     pub queue_packets: usize,
+    pub max_xudp_associations: usize,
+    pub xudp_resume_timeout: Duration,
+    pub xudp_detached_packets: usize,
     pub encryption_limits: encryption::Limits,
 }
 impl Default for Options {
@@ -32,6 +35,9 @@ impl Default for Options {
             udp_idle_timeout: Duration::from_secs(60),
             max_xudp_sessions: 32,
             queue_packets: 32,
+            max_xudp_associations: 1024,
+            xudp_resume_timeout: Duration::from_secs(60),
+            xudp_detached_packets: 8,
             encryption_limits: encryption::Limits::default(),
         }
     }
@@ -43,6 +49,9 @@ impl Options {
             || self.max_handshakes > self.max_connections
             || self.max_xudp_sessions == 0
             || self.max_xudp_sessions > 1024
+            || self.max_xudp_associations == 0
+            || self.max_xudp_associations > 65536
+            || self.xudp_detached_packets > 1024
             || self.queue_packets == 0
             || self.queue_packets > 1024
             || self.connection_buffers.bytes() < 262144
@@ -54,6 +63,7 @@ impl Options {
             self.handshake_timeout,
             self.idle_timeout,
             self.udp_idle_timeout,
+            self.xudp_resume_timeout,
         ] {
             if duration.is_zero() || Deadline::after(duration).is_err() {
                 return Err(Error::Preparation("VLESS timeout"));

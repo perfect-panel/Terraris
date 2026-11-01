@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 //! Protocol-independent lifecycle ports. Implementations must be rollback-safe
-//! during preparation and keep all accepted work in their Core task scope.
+//! during preparation. Connection work belongs to Core; shared services own
+//! bounded task groups that are joined by their explicit close lifecycle.
 
 mod publication;
 pub use publication::{Publication, ReadPermit, WritePermit};
@@ -122,6 +123,14 @@ pub trait SharedServices: Send + Sync + 'static {
 /// substream before proxy traffic.
 pub trait RuntimeFactory: Send + Sync + 'static {
     type Shared: SharedServices;
+    /// Process-owned services outlive individual generations. One factory belongs
+    /// to one Supervisor lifecycle. Factories without such services need no
+    /// shutdown work. Both methods must be idempotent.
+    fn abort(&self) {}
+    async fn close(&self, _context: &OperationContext) -> Result<(), Error> {
+        Ok(())
+    }
+
     fn supports(&self, protocol: &ProtocolName) -> bool;
     /// Validate and compile all non-default shared DNS/routing/outbound fields.
     /// Returning success while silently ignoring unsupported policy is invalid.

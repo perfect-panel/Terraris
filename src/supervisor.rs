@@ -922,8 +922,12 @@ impl<F: RuntimeFactory> Supervisor<F> {
             self.fingerprints.replace(BTreeMap::new());
         }
         // Drain before cancelling runtime session tokens.
-        self.reap_retired(context).await?;
+        if let Err(error) = self.reap_retired(context).await {
+            self.factory.abort();
+            return Err(error);
+        }
         self.cancel.cancel();
+        self.factory.close(context).await.map_err(Error::Runtime)?;
         self.flush_reports(context).await
     }
 }
@@ -954,6 +958,7 @@ impl<F: RuntimeFactory> Supervisor<F> {
             generations
         };
         self.cancel.cancel();
+        self.factory.abort();
         for generation in generations {
             for runtime in generation.runtimes.values() {
                 runtime.abort();

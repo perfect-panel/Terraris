@@ -45,6 +45,7 @@ pub struct Factory {
     connections: Arc<Semaphore>,
     handshakes: Arc<Semaphore>,
     encryption_cache: Mutex<BTreeMap<[u8; 32], Weak<encryption::Server>>>,
+    associations: Arc<super::associations::Registry>,
 }
 impl Factory {
     pub fn new(
@@ -63,14 +64,32 @@ impl Factory {
             policies,
             connections: Arc::new(Semaphore::new(options.max_connections)),
             handshakes: Arc::new(Semaphore::new(options.max_handshakes)),
+            associations: super::associations::Registry::new(options.clone()),
             options,
             encryption_cache: Mutex::new(BTreeMap::new()),
         })
+    }
+    pub fn xudp_snapshot(&self) -> super::XudpSnapshot {
+        self.associations.snapshot()
     }
 }
 #[async_trait]
 impl RuntimeFactory for Factory {
     type Shared = Egress;
+    fn abort(&self) {
+        self.associations.abort();
+    }
+    async fn close(&self, context: &OperationContext) -> Result<(), runtime::Error> {
+        self.associations
+            .close(
+                context
+                    .deadline()
+                    .unwrap_or_else(|| Deadline::at(tokio::time::Instant::now())),
+            )
+            .await;
+        Ok(())
+    }
+
     fn supports(&self, protocol: &ProtocolName) -> bool {
         protocol.as_str() == "vless"
     }
@@ -130,6 +149,7 @@ impl RuntimeFactory for Factory {
             encryption: Mutex::new(encrypted),
             client,
             policies: self.policies.clone(),
+            associations: self.associations.clone(),
             registry: self.ingress.clone(),
             binding: Mutex::new(None),
             auth: Arc::new(RwLock::new(None)),
@@ -155,6 +175,7 @@ pub(super) struct Driver {
     encryption: Mutex<Option<Arc<encryption::Server>>>,
     pub(super) client: Arc<dyn ProtocolClient>,
     pub(super) policies: Arc<Policies>,
+    pub(super) associations: Arc<super::associations::Registry>,
     registry: Arc<Registry>,
     binding: Mutex<Option<Arc<Ingress>>>,
     auth: Arc<RwLock<Option<Arc<Auth>>>>,

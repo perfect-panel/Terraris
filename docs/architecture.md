@@ -1,6 +1,6 @@
 # Terraris 架构设计
 
-状态：架构基线。日期：2026-11-01。B1–B4 基础设施与控制面，以及 B5 VLESS/TCP、UDP/XUDP、VLESS Encryption、flow 策略和 run CLI 已实现。当前能力见 [README](../README.md) 与 [VLESS 文档](vless.md)；生产运维和其他协议仍在后续阶段。
+状态：架构基线。日期：2026-11-01。B1–B4 基础设施与控制面，以及 B5 VLESS/TCP、UDP/XUDP、GlobalID 迁移、VLESS Encryption、flow 策略和 run CLI 已实现。当前能力见 [README](../README.md) 与 [VLESS 文档](vless.md)；生产运维和其他协议仍在后续阶段。
 
 Terraris 以 Polaris 的实际模块和生命周期为架构基线：`panel` 隔离面板协议，`supervisor` 管服务器配置代次，`controller` 管单协议用户与维护任务，`protocol::runtimekit` 统一运行时装配，`protocol::flow` 统一数据面策略。通过 Rust 的所有权、类型和异步任务模型实现这些边界。
 
@@ -48,6 +48,8 @@ TCP 字节流和 UDP 数据报分别建模。QUIC 流可以交付字节流接口
 ## 3 工程与模块边界
 
 初期使用一个 Cargo package，包含二进制入口和可测试的内部模块，模块命名与 Polaris 对齐。现成 Rust 协议引擎以依赖引入；需要自研且可独立复用的引擎再单独拆 crate。crate 数量不决定架构分层，跨模块依赖规则从第一版生效。
+
+当前 DNS 仅为有并发上限的系统解析封装；限速已实现按协议/订阅共享；路由仍只有直连和地址族策略，没有规则编译或代理出站。下表中的 `route` / `dns` / `outbound` 是目标模块，不表示已经完成。
 
 以下是目标模块划分；当前已实现 `app`、`config`、`panel` 及 B1–B4 基础设施和控制面。B5 已引入 VLESS、flow、限速和设备执行器；其余目标模块按后续阶段实施：
 
@@ -141,6 +143,8 @@ Server 的认证读取与 `PreparedUsers` 提交必须通过同一发布机制�
 Polaris 已将协议 Counter 保留在 Supervisor 中并跨代次注入。Terraris 将稳定身份延伸到用户、限速和会话注册服务，使旧连接排空期间仍受当前用户撤销和限速约束；这是明确的设计扩展，不声称 Polaris 已采用同样的全部状态布局。
 
 候选准备只能构造私有快照，不得提前修改共享 UserStore、限速桶或设备状态。跨代次提交用统一发布门协调；替换协议对象不销毁待上报流量。Rust 的 `Drop` 负责同步资源释放和取消兜底，等待任务、刷新队列仍通过显式异步 `close` 完成。
+
+GlobalID UDP socket 由进程级会话表管理，承载连接只持有可失效的接管许可。新连接重做用户/设备准入后才能迁移；旧连接退出不取消新连接的许可。用户认证版本和出站策略参与迁移键，断开缓存受时间、会话数量和 buffer 预算限制。
 
 关闭旧 Runtime 只取消自己的任务、关闭自己的会话并释放借用句柄，不清空新代次仍在使用的 UserStore、Limiter 或 Registry，也不启动第二个 Reporter。维护任务交接使用作用域所有者标识，已失去所有权的旧任务不能提交迟到结果。
 

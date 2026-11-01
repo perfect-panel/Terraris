@@ -13,3 +13,6 @@ mod server;
 mod udp;
 pub use options::Options;
 pub use server::Factory;
+
+mod associations;
+pub use associations::Snapshot as XudpSnapshot;

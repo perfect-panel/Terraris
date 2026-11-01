@@ -14,6 +14,8 @@
 | `Supervisor` | 配置拉取、候选准备、原子发布、旧代次退役、最终报告与关闭 |
 | `reports::Reports` | 按协议作用域保留的有界内存增量与在线记录；报告 ACK 只确认对应批次 |
 
+进程级服务由 RuntimeFactory 的 `abort` / `close` 生命周期管理，VLESS GlobalID 表跨代次共享；Supervisor 关闭所有代次后再回收这些服务并冲刷报告。单个退役 Runtime 不能关闭新代次仍在使用的共享 UDP socket。
+
 调用方为 `Supervisor::new` 提供一个面板 `Connection`、真实 `RuntimeFactory`、进程级 `BufferScope`、上限、`Metrics`、`FingerprintSink`，以及可选 `StatusSampler`。PPanel 的 `CertificateFingerprints` 已实现 sink，必须传入创建该 Connection 时使用的同一实例。没有 sampler 时不发送虚构的 CPU、内存、磁盘数据。
 
 `sync_config` 完成一次同步，并在成功发布后启动该代次的维护任务。`run` 额外驱动配置轮询、退役清理和已移除协议的报告重试；其 context 取消后进入显式关闭。单独调用 `sync_config` 的宿主也必须调用 `close`，并定期调用 `reap_retired`。Drop 或强制 abort 只能停止准入和请求取消，确认任务、socket 和 buffer 回收仍需要等待 `close`。

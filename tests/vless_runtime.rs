@@ -48,9 +48,25 @@ struct Node {
     supervisor: Arc<Supervisor<vless::Factory>>,
     address: SocketAddr,
     budget: Budget,
+    factory: Arc<vless::Factory>,
 }
 impl Node {
-    async fn new(mut configure: impl FnMut(&mut Value), userlist: Value) -> Self {
+    async fn new(configure: impl FnMut(&mut Value), userlist: Value) -> Self {
+        Self::with_options(
+            configure,
+            userlist,
+            vless::Options {
+                listen: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+    async fn with_options(
+        mut configure: impl FnMut(&mut Value),
+        userlist: Value,
+        protocol_options: vless::Options,
+    ) -> Self {
         let address = unused().await;
         let mut value = config(address);
         configure(&mut value);
@@ -62,10 +78,7 @@ impl Node {
         let factory = Arc::new(
             vless::Factory::new(
                 connection.clone(),
-                vless::Options {
-                    listen: IpAddr::V4(Ipv4Addr::LOCALHOST),
-                    ..Default::default()
-                },
+                protocol_options,
                 flow::Options::default(),
             )
             .unwrap(),
@@ -75,7 +88,7 @@ impl Node {
         let supervisor = Arc::new(
             Supervisor::new(
                 connection,
-                factory,
+                factory.clone(),
                 buffers,
                 Options {
                     drain_timeout: Duration::from_secs(1),
@@ -94,6 +107,7 @@ impl Node {
             supervisor,
             address,
             budget,
+            factory,
         }
     }
     fn runtime(&self) -> Arc<terraris::protocol::runtimekit::Runtime> {
@@ -458,6 +472,90 @@ async fn official_xray_proxies_tcp_and_xudp_with_all_encryption_modes() {
                 .unwrap();
             assert_eq!(&response[10..n], b"xudp");
         }
+        // Force the current encrypted/plain carrier to retire while keeping
+        // Xray, its SOCKS UDP socket, and therefore its GlobalID alive.
+        let observer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target = observer.local_addr().unwrap();
+        let mut request = vec![0, 0, 0, 1, 127, 0, 0, 1];
+        request.extend(target.port().to_be_bytes());
+        request.extend(b"gid-before");
+        udp.send_to(&request, relay).await.unwrap();
+        let before = receive_udp(&observer, b"gid-before").await;
+        observer.send_to(b"before-ack", before).await.unwrap();
+        let mut response = [0; 1024];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(5), udp.recv_from(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&response[10..n], b"before-ack");
+        let mut migration = config(node.address);
+        migration["data"]["traffic_report_threshold"] = json!(4096);
+        if mode != "none" {
+            let protocol = &mut migration["data"]["protocols"][0];
+            protocol["encryption"] = json!("mlkem768x25519plus");
+            protocol["encryption_mode"] = json!(mode);
+            protocol["encryption_ticket"] = json!("600s");
+            protocol["encryption_server_padding"] = json!("100-35-35");
+            protocol["encryption_private_key"] = json!(private);
+        }
+        node.panel.push(Reply::json(migration));
+        node.panel.push(Reply::json(users()));
+        node.supervisor.sync_config(&ctx()).await.unwrap();
+        node.supervisor.reap_retired(&ctx()).await.unwrap();
+        assert!(
+            node.factory.xudp_snapshot().detached > 0,
+            "Xray must send a nonzero GlobalID"
+        );
+        let mut request = vec![0, 0, 0, 1, 127, 0, 0, 1];
+        request.extend(target.port().to_be_bytes());
+        request.extend(b"gid-after");
+        let mut observed = [0; 1024];
+        let mut after = None;
+        for _ in 0..20 {
+            udp.send_to(&request, relay).await.unwrap();
+            if let Ok(Ok((n, source))) = tokio::time::timeout(
+                Duration::from_millis(100),
+                observer.recv_from(&mut observed),
+            )
+            .await
+            {
+                assert_eq!(&observed[..n], b"gid-after");
+                after = Some(source);
+                break;
+            }
+        }
+        assert_eq!(
+            after,
+            Some(before),
+            "Xray GlobalID must preserve the UDP source endpoint for {mode}"
+        );
+        observer.send_to(b"after-ack", before).await.unwrap();
+        // One SOCKS UDP association carries replies from all destinations.
+        // Xray's first retry on a new mux worker can use its original default
+        // destination before later Keep frames carry the explicit destination.
+        let mut received_ack = false;
+        for _ in 0..20 {
+            let (n, _) = tokio::time::timeout(Duration::from_secs(5), udp.recv_from(&mut response))
+                .await
+                .unwrap()
+                .unwrap();
+            let reply_source = SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(
+                    response[4],
+                    response[5],
+                    response[6],
+                    response[7],
+                )),
+                u16::from_be_bytes([response[8], response[9]]),
+            );
+            if reply_source == target {
+                assert_eq!(&response[10..n], b"after-ack");
+                received_ack = true;
+                break;
+            }
+            assert!([first_udp, second_udp].contains(&reply_source));
+        }
+        assert!(received_ack);
         drop(association);
         drop(udp);
         child.kill().await.unwrap();
@@ -720,4 +818,467 @@ async fn rapid_reload_and_last_driver_release_do_not_deadlock_accept_routing() {
     })
     .await
     .unwrap();
+}
+
+type MuxReader = xudp::Reader<tokio::net::tcp::OwnedReadHalf>;
+struct MuxPeer {
+    reader: MuxReader,
+    writer: tokio::net::tcp::OwnedWriteHalf,
+}
+impl MuxPeer {
+    async fn connect(node: &Node, uuid: &str) -> Self {
+        let stream = node.connect(uuid, wire::Command::Xudp, None).await;
+        let (read, writer) = stream.into_split();
+        let budget = Budget::new(Limits::new(1 << 20, 32).unwrap());
+        Self {
+            reader: xudp::Reader::new(
+                read,
+                BufferScope::new(budget.root_scope(), 65535).unwrap(),
+                65535,
+            )
+            .unwrap(),
+            writer,
+        }
+    }
+    async fn new_flow(
+        &mut self,
+        id: u16,
+        global: Option<[u8; 8]>,
+        target: SocketAddr,
+        payload: &[u8],
+    ) {
+        xudp::write(
+            &mut self.writer,
+            &xudp::Metadata {
+                id,
+                status: xudp::Status::New,
+                data: true,
+                error: false,
+                target: Some(Address::from_socket(target).unwrap()),
+                global_id: global,
+            },
+            Some(payload),
+        )
+        .await
+        .unwrap();
+    }
+    async fn keep(&mut self, id: u16, payload: &[u8]) {
+        xudp::write(
+            &mut self.writer,
+            &xudp::Metadata {
+                id,
+                status: xudp::Status::Keep,
+                data: true,
+                error: false,
+                target: None,
+                global_id: None,
+            },
+            Some(payload),
+        )
+        .await
+        .unwrap();
+    }
+    async fn end(&mut self, id: u16) {
+        xudp::write(
+            &mut self.writer,
+            &xudp::Metadata {
+                id,
+                status: xudp::Status::End,
+                data: false,
+                error: false,
+                target: None,
+                global_id: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    async fn frame(&mut self) -> xudp::Frame {
+        tokio::time::timeout(Duration::from_secs(3), self.reader.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+    }
+    async fn data(&mut self, id: u16, expected: &[u8]) {
+        let frame = self.frame().await;
+        assert_eq!(frame.metadata.id, id);
+        assert_eq!(frame.metadata.status, xudp::Status::Keep);
+        assert_eq!(frame.payload.unwrap().as_slice(), expected);
+    }
+}
+async fn receive_udp(socket: &UdpSocket, expected: &[u8]) -> SocketAddr {
+    let mut data = [0; 1024];
+    let (n, peer) = tokio::time::timeout(Duration::from_secs(3), socket.recv_from(&mut data))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&data[..n], expected);
+    peer
+}
+async fn until(mut condition: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !condition() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn global_id_reconnect_preserves_udp_port_and_forwards_buffered_reply_once() {
+    let node = Node::new(|_| {}, users()).await;
+    let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut first = MuxPeer::connect(&node, UUID1).await;
+    let global = Some([0x51; 8]);
+    first
+        .new_flow(1, global, target.local_addr().unwrap(), b"old")
+        .await;
+    let source = receive_udp(&target, b"old").await;
+    target.send_to(b"ack", source).await.unwrap();
+    first.data(1, b"ack").await;
+    drop(first);
+    until(|| node.factory.xudp_snapshot().detached == 1).await;
+    let counted = node.runtime().core().reports().snapshot().pending_bytes;
+    target.send_to(b"queued", source).await.unwrap();
+    until(|| node.factory.xudp_snapshot().buffered_packets == 1).await;
+    assert_eq!(
+        node.runtime().core().reports().snapshot().pending_bytes,
+        counted
+    );
+    let mut second = MuxPeer::connect(&node, UUID1).await;
+    second
+        .new_flow(9, global, target.local_addr().unwrap(), b"new")
+        .await;
+    assert_eq!(receive_udp(&target, b"new").await, source);
+    second.data(9, b"queued").await;
+    target.send_to(b"reply", source).await.unwrap();
+    second.data(9, b"reply").await;
+    assert_eq!(node.factory.xudp_snapshot().associations, 1);
+    assert_eq!(
+        node.runtime().core().reports().snapshot().pending_bytes,
+        3 + 3 + 3 + 6 + 5
+    );
+    drop(second);
+    node.close().await;
+    assert_eq!(node.factory.xudp_snapshot().associations, 0);
+    assert_eq!(node.factory.xudp_snapshot().tracked_tasks, 0);
+}
+#[tokio::test]
+async fn active_global_takeover_rejects_old_packets_and_late_end_cannot_detach_new_owner() {
+    let node = Node::new(|_| {}, users()).await;
+    let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let global = Some([0x52; 8]);
+    let mut old = MuxPeer::connect(&node, UUID1).await;
+    old.new_flow(1, global, target.local_addr().unwrap(), b"old")
+        .await;
+    let source = receive_udp(&target, b"old").await;
+    let mut new = MuxPeer::connect(&node, UUID1).await;
+    new.new_flow(42, global, target.local_addr().unwrap(), b"new")
+        .await;
+    assert_eq!(receive_udp(&target, b"new").await, source);
+    let ended = old.frame().await;
+    assert_eq!(ended.metadata.id, 1);
+    assert_eq!(ended.metadata.status, xudp::Status::End);
+    old.keep(1, b"stale").await;
+    let ended = old.frame().await;
+    assert_eq!(ended.metadata.status, xudp::Status::End);
+    let mut bytes = [0; 64];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), target.recv_from(&mut bytes))
+            .await
+            .is_err()
+    );
+    old.end(1).await;
+    drop(old);
+    new.keep(42, b"live").await;
+    assert_eq!(receive_udp(&target, b"live").await, source);
+    target.send_to(b"after", source).await.unwrap();
+    new.data(42, b"after").await;
+    assert_eq!(node.factory.xudp_snapshot().attached, 1);
+    drop(new);
+    node.close().await;
+}
+#[tokio::test]
+async fn global_ids_are_isolated_by_user_and_zero_ids_never_share_sockets() {
+    let node = Node::new(|_| {}, users()).await;
+    let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut first = MuxPeer::connect(&node, UUID1).await;
+    let mut second = MuxPeer::connect(&node, UUID2).await;
+    let global = Some([0x53; 8]);
+    first
+        .new_flow(1, global, target.local_addr().unwrap(), b"user1")
+        .await;
+    let a = receive_udp(&target, b"user1").await;
+    second
+        .new_flow(2, global, target.local_addr().unwrap(), b"user2")
+        .await;
+    let b = receive_udp(&target, b"user2").await;
+    assert_ne!(a, b);
+    target.send_to(b"private1", a).await.unwrap();
+    target.send_to(b"private2", b).await.unwrap();
+    first.data(1, b"private1").await;
+    second.data(2, b"private2").await;
+    first
+        .new_flow(3, Some([0; 8]), target.local_addr().unwrap(), b"zero1")
+        .await;
+    let a = receive_udp(&target, b"zero1").await;
+    first
+        .new_flow(4, Some([0; 8]), target.local_addr().unwrap(), b"zero2")
+        .await;
+    let b = receive_udp(&target, b"zero2").await;
+    assert_ne!(a, b);
+    drop(first);
+    drop(second);
+    until(|| node.factory.xudp_snapshot().associations == 2).await;
+    node.close().await;
+}
+#[tokio::test]
+async fn global_migration_survives_retired_generation_cleanup() {
+    let node = Node::new(|_| {}, users()).await;
+    let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let global = Some([0x54; 8]);
+    let mut old = MuxPeer::connect(&node, UUID1).await;
+    old.new_flow(1, global, target.local_addr().unwrap(), b"before")
+        .await;
+    let source = receive_udp(&target, b"before").await;
+    let mut next = config(node.address);
+    next["data"]["traffic_report_threshold"] = json!(2048);
+    node.panel.push(Reply::json(next));
+    node.panel.push(Reply::json(users()));
+    node.supervisor.sync_config(&ctx()).await.unwrap();
+    let mut new = MuxPeer::connect(&node, UUID1).await;
+    new.new_flow(11, global, target.local_addr().unwrap(), b"moved")
+        .await;
+    assert_eq!(receive_udp(&target, b"moved").await, source);
+    drop(old);
+    node.supervisor.reap_retired(&ctx()).await.unwrap();
+    assert_eq!(node.supervisor.snapshot().retired, 0);
+    new.keep(11, b"after").await;
+    assert_eq!(receive_udp(&target, b"after").await, source);
+    target.send_to(b"ok", source).await.unwrap();
+    new.data(11, b"ok").await;
+    drop(new);
+    node.close().await;
+}
+#[tokio::test]
+async fn detached_cache_is_bounded_and_expiry_releases_socket_and_buffers() {
+    let options = vless::Options {
+        listen: IpAddr::V4(Ipv4Addr::LOCALHOST),
+        xudp_resume_timeout: Duration::from_millis(150),
+        xudp_detached_packets: 2,
+        max_xudp_associations: 1,
+        ..Default::default()
+    };
+    let node = Node::with_options(|_| {}, users(), options).await;
+    let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut first = MuxPeer::connect(&node, UUID1).await;
+    first
+        .new_flow(1, Some([0x55; 8]), target.local_addr().unwrap(), b"first")
+        .await;
+    let source = receive_udp(&target, b"first").await;
+    let mut extra = MuxPeer::connect(&node, UUID1).await;
+    extra
+        .new_flow(2, Some([0x56; 8]), target.local_addr().unwrap(), b"full")
+        .await;
+    assert_eq!(extra.frame().await.metadata.status, xudp::Status::End);
+    drop(extra);
+    drop(first);
+    until(|| node.factory.xudp_snapshot().detached == 1).await;
+    for _ in 0..8 {
+        target.send_to(b"buffer", source).await.unwrap();
+    }
+    until(|| node.factory.xudp_snapshot().buffered_packets == 2).await;
+    assert_eq!(node.runtime().core().reports().snapshot().pending_bytes, 5);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    until(|| {
+        node.factory.xudp_snapshot().associations == 0 && node.budget.snapshot().used().bytes() == 0
+    })
+    .await;
+    let _reserved = UdpSocket::bind(source).await.unwrap();
+    node.close().await;
+}
+#[tokio::test]
+async fn credential_change_discards_dormant_global_state_before_uuid_reuse() {
+    let node = Node::new(|_| {}, users()).await;
+    let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let global = Some([0x57; 8]);
+    let mut old = MuxPeer::connect(&node, UUID1).await;
+    old.new_flow(1, global, target.local_addr().unwrap(), b"old")
+        .await;
+    let source = receive_udp(&target, b"old").await;
+    drop(old);
+    until(|| node.factory.xudp_snapshot().detached == 1).await;
+    target.send_to(b"secret", source).await.unwrap();
+    until(|| node.factory.xudp_snapshot().buffered_packets == 1).await;
+    let new_uuid = "b831381d-6324-4d53-ad4f-8cda48b30813";
+    let mut next = users();
+    next["users"][0]["uuid"] = json!(new_uuid);
+    node.panel.push(Reply::json(next));
+    node.runtime().controller.sync_users(&ctx()).await.unwrap();
+    until(|| {
+        node.factory.xudp_snapshot().associations == 0 && node.budget.snapshot().used().bytes() == 0
+    })
+    .await;
+    let _reserved = UdpSocket::bind(source).await.unwrap();
+    let mut new = MuxPeer::connect(&node, new_uuid).await;
+    new.new_flow(2, global, target.local_addr().unwrap(), b"new")
+        .await;
+    let current = receive_udp(&target, b"new").await;
+    assert_ne!(current, source);
+    target.send_to(b"fresh", current).await.unwrap();
+    new.data(2, b"fresh").await;
+    drop(new);
+    node.close().await;
+}
+
+#[tokio::test]
+async fn changed_egress_policy_does_not_reuse_a_global_socket_from_the_old_policy() {
+    let node = Node::new(|_| {}, users()).await;
+    let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut first = MuxPeer::connect(&node, UUID1).await;
+    let global = Some([0x58; 8]);
+    first
+        .new_flow(1, global, target.local_addr().unwrap(), b"old-policy")
+        .await;
+    let original = receive_udp(&target, b"old-policy").await;
+    let mut next = config(node.address);
+    next["data"]["ip_strategy"] = json!("ipv4_only");
+    node.panel.push(Reply::json(next));
+    node.panel.push(Reply::json(users()));
+    node.supervisor.sync_config(&ctx()).await.unwrap();
+    let mut second = MuxPeer::connect(&node, UUID1).await;
+    second
+        .new_flow(2, global, target.local_addr().unwrap(), b"new-policy")
+        .await;
+    let current = receive_udp(&target, b"new-policy").await;
+    assert_ne!(current, original);
+    drop(first);
+    drop(second);
+    node.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_global_claims_publish_one_reply_owner_and_keep_one_socket() {
+    let node = Node::new(|_| {}, users()).await;
+    let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let global = Some([0x59; 8]);
+    let mut first = MuxPeer::connect(&node, UUID1).await;
+    first
+        .new_flow(1, global, target.local_addr().unwrap(), b"base")
+        .await;
+    let original = receive_udp(&target, b"base").await;
+    let mut left = MuxPeer::connect(&node, UUID1).await;
+    let mut right = MuxPeer::connect(&node, UUID1).await;
+    let address = target.local_addr().unwrap();
+    tokio::join!(
+        left.new_flow(2, global, address, b"left"),
+        right.new_flow(3, global, address, b"right")
+    );
+    until(|| node.factory.xudp_snapshot().reattachments == 2).await;
+    assert_eq!(node.factory.xudp_snapshot().associations, 1);
+    assert_eq!(node.factory.xudp_snapshot().attached, 1);
+    target.send_to(b"owner", original).await.unwrap();
+    let (a, b) = tokio::join!(left.frame(), right.frame());
+    assert_eq!(
+        usize::from(a.metadata.status == xudp::Status::Keep)
+            + usize::from(b.metadata.status == xudp::Status::Keep),
+        1
+    );
+    let winner = if a.metadata.status == xudp::Status::Keep {
+        a
+    } else {
+        b
+    };
+    assert_eq!(winner.payload.unwrap().as_slice(), b"owner");
+    drop(first);
+    drop(left);
+    drop(right);
+    node.close().await;
+}
+
+#[tokio::test]
+async fn active_global_association_is_closed_and_joined_on_node_shutdown() {
+    let node = Node::new(|_| {}, users()).await;
+    let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut client = MuxPeer::connect(&node, UUID1).await;
+    client
+        .new_flow(
+            1,
+            Some([0x60; 8]),
+            target.local_addr().unwrap(),
+            b"shutdown",
+        )
+        .await;
+    let source = receive_udp(&target, b"shutdown").await;
+    assert_eq!(node.factory.xudp_snapshot().attached, 1);
+    node.close().await;
+    assert_eq!(node.factory.xudp_snapshot().associations, 0);
+    assert_eq!(node.factory.xudp_snapshot().tracked_tasks, 0);
+    let _released = UdpSocket::bind(source).await.unwrap();
+    drop(client);
+}
+#[tokio::test]
+async fn global_migration_preserves_both_ipv4_and_ipv6_socket_owners() {
+    let node = Node::new(|_| {}, users()).await;
+    let v4 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let v6 = UdpSocket::bind("[::1]:0").await.unwrap();
+    let global = Some([0x61; 8]);
+    let mut old = MuxPeer::connect(&node, UUID1).await;
+    old.new_flow(1, global, v4.local_addr().unwrap(), b"v4")
+        .await;
+    let source4 = receive_udp(&v4, b"v4").await;
+    xudp::write(
+        &mut old.writer,
+        &xudp::Metadata {
+            id: 1,
+            status: xudp::Status::Keep,
+            data: true,
+            error: false,
+            target: Some(Address::from_socket(v6.local_addr().unwrap()).unwrap()),
+            global_id: None,
+        },
+        Some(b"v6"),
+    )
+    .await
+    .unwrap();
+    let source6 = receive_udp(&v6, b"v6").await;
+    drop(old);
+    until(|| node.factory.xudp_snapshot().detached == 1).await;
+    let mut new = MuxPeer::connect(&node, UUID1).await;
+    new.new_flow(7, global, v6.local_addr().unwrap(), b"v6-again")
+        .await;
+    assert_eq!(receive_udp(&v6, b"v6-again").await, source6);
+    xudp::write(
+        &mut new.writer,
+        &xudp::Metadata {
+            id: 7,
+            status: xudp::Status::Keep,
+            data: true,
+            error: false,
+            target: Some(Address::from_socket(v4.local_addr().unwrap()).unwrap()),
+            global_id: None,
+        },
+        Some(b"v4-again"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(receive_udp(&v4, b"v4-again").await, source4);
+    v4.send_to(b"reply4", source4).await.unwrap();
+    v6.send_to(b"reply6", source6).await.unwrap();
+    let mut replies = std::collections::BTreeSet::new();
+    for _ in 0..2 {
+        let frame = new.frame().await;
+        assert_eq!(frame.metadata.id, 7);
+        replies.insert(frame.payload.unwrap().as_slice().to_vec());
+    }
+    assert_eq!(
+        replies,
+        std::collections::BTreeSet::from([b"reply4".to_vec(), b"reply6".to_vec()])
+    );
+    assert_eq!(node.factory.xudp_snapshot().associations, 1);
+    drop(new);
+    node.close().await;
 }

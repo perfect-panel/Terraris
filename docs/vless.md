@@ -8,7 +8,7 @@
 | --- | --- |
 | VLESS | version 0、UUID 多用户、TCP command 1、UDP command 2、XUDP command 3 |
 | UDP | u16 长度报文，保留空包与边界，最大应用报文 65507 字节 |
-| XUDP | New / Keep / End / KeepAlive、多个逻辑 UDP 会话、逐包目的地址、回复来源地址、会话与队列上限 |
+| XUDP | New / Keep / End / KeepAlive、多逻辑 UDP 会话、逐包目的地址、GlobalID 跨连接迁移、身份隔离、有界缓存与回复队列 |
 | Encryption | `mlkem768x25519plus`；`native`、`xorpub`、`random` |
 | 密钥 | X25519 32 字节私钥、ML-KEM-768 64 字节 seed，以及最多 8 项混合密钥链 |
 | 握手 | 混合 ML-KEM-768 + X25519 PFS、1-RTT、带票据的 0-RTT；AES-256-GCM / ChaCha20-Poly1305 自动识别 |
@@ -19,7 +19,26 @@
 
 当前载体为 TCP。TLS、REALITY、Vision、XHTTP、WebSocket/gRPC 等组合没有实现；相关非默认字段会拒绝，不能仅凭 VLESS 名称认为所有组合均可用。VLESS 用户凭据须是可解析的 UUID，等价 UUID 编码冲突会拒绝整个用户快照。
 
-XUDP 的 UDP socket 生命周期绑定当前承载连接。GlobalID 字段可以解析，但当前不在断开后通过 GlobalID 恢复旧 UDP socket，不承诺跨承载连接的出口端口保持。逻辑会话内的多个目的地址使用同一地址族 socket。普通 VLESS UDP 则只接受指定目标的回复。
+XUDP 的 UDP socket 由进程级会话表持有，承载连接只持有当前接管许可。非零 GlobalID 可在保留期内迁移到新的承载连接，复用同一地址族的 UDP socket，保持出口端口；零 GlobalID 或缺失 GlobalID 使用连接内会话。普通 VLESS UDP 仍只接受指定目标的回复。
+
+## GlobalID 迁移
+
+迁移键包含认证 Store、订阅 ID、凭据版本、当前出站策略和 8 字节 GlobalID。GlobalID 本身不是认证凭据：新承载及逻辑会话先验证 UUID 和当前用户策略，并重新经过设备准入；相同 GlobalID 在其他用户、其他认证版本或不兼容出站策略下不会取得旧 socket。源 IP 可以变化，但新 IP 必须满足面板设备名额约束。
+
+新连接接管后，旧许可立即失效，旧连接的 Keep、迟到 End 和 Drop 不得改变新所有者。排队回复在发送前检查接管代次；尚未写出的旧回复可以重新投递到当前连接。正在写入的帧若被接管中断，会关闭旧承载，避免在同一字节流中留下半帧。已被底层传输接受的字节不能撤回。部分帧的已写 payload 前缀仍消耗限速额度，未使用的额度会退回；用户流量仅在完整 UDP payload 写入后提交，迁移重投不会重复提交同一完整报文。
+
+断线或 End 后，非零 GlobalID 默认保留 60 秒；不延长设备租约或在线状态，也不持有旧配置代次的会话许可。保留期间最多缓冲 8 个尚未计费的 UDP 回复，远端报文不会延长保留期限。恢复后回复通过新连接发送，成功的 payload 只计费一次。缓冲满时丢弃完整 UDP 报文；进程 buffer 额度仍是所有缓存和在途报文的总上限。
+
+配置项：
+
+- `max_xudp_sessions`：每条承载连接的逻辑会话上限，默认 32。
+- `max_xudp_associations`：进程级活跃和保留会话的总上限，默认 1024，包含无 GlobalID 的会话。
+- `xudp_resume_timeout_seconds`：断开后的保留期，默认 60 秒。
+- `xudp_detached_packets`：每个保留会话的回复缓存条数，默认 8；0 表示不缓存回复但仍保留 socket。
+
+删除用户、改变凭据、快照失效或保留期结束会清理对应 socket 和缓存。显式节点退出还会取消并 join 进程级收包和清理任务。兼容配置重载保留会话；出站策略变化不复用旧策略下的映射。进程重启不保留 socket，因此不支持跨进程或跨节点恢复。
+
+`Factory::xudp_snapshot` 提供会话总数、已接管/暂存数量、缓存报文、任务数和成功重接次数，不暴露 GlobalID、UUID 或 IP 标签。
 
 ## 运行
 
@@ -76,12 +95,12 @@ Reports 仍是内存队列。正常退出会冲刷，但崩溃不保留；PPanel
 
 ## 验证与复现
 
-普通测试覆盖 wire golden bytes、地址与长度边界、取消后的半帧、空 UDP、XUDP 资源上限、共享带宽、计数预留、设备并发合并与 TTL、用户撤销、同端口切换、候选回滚，以及 CLI 启动和 SIGTERM 退出。
+普通测试覆盖 wire golden bytes、地址与长度边界、取消后的半帧、空 UDP、XUDP 资源上限、共享带宽、计数预留、设备并发合并与 TTL、用户撤销、同端口切换、候选回滚，以及 CLI 启动和 SIGTERM 退出。GlobalID 测试还覆盖并发接管、端口保持、迟到回复、旧 End 竞争、零 ID、用户/认证版本/出站策略隔离、缓存满额、过期及退出回收。
 
 额外的本地交叉验证固定使用 [Xray commit a4a3dff](https://github.com/XTLS/Xray-core/commit/a4a3dff5b20c2faae567b742c172c7b95e75c083)：
 
 - 独立 Encryption 客户端：3 种外观 × 3 种密钥组合 × 2 个 AEAD × 2 个 RTT 模式，共 36 组；每组双向传输，0-RTT 组另验证重放拒绝。
-- 完整 Xray：经 SOCKS 入口连接 Terraris，验证 TCP 与 XUDP，覆盖明文 loopback 和三种 Encryption 外观；保留同一 Xray 进程跨 Terraris 代次切换测试恢复票据。
+- 完整 Xray：经 SOCKS 入口连接 Terraris，验证 TCP 与 XUDP，覆盖明文 loopback 和三种 Encryption 外观；保留同一 Xray 进程跨 Terraris 代次切换测试恢复票据，并强制旧承载连接退出，检查同一 SOCKS UDP 来源的 GlobalID 在新承载上继续使用原出口端口。
 - Go 生成的 KDF/AEAD 固定向量验证二进制 context、BLAKE3 块/树边界与两种 AEAD，Rust 记录测试覆盖 nonce 换钥和篡改拒绝。
 
 复现外部客户端验证需 Go；Rust 的正常构建不需要它：

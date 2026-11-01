@@ -32,6 +32,9 @@ pub struct Settings {
     pub max_handshakes: usize,
     pub max_xudp_sessions: usize,
     pub queue_packets: usize,
+    pub max_xudp_associations: usize,
+    pub xudp_resume_timeout_seconds: u64,
+    pub xudp_detached_packets: usize,
     pub max_users: usize,
     pub report_entries: usize,
     pub user_max_age_seconds: u64,
@@ -54,6 +57,9 @@ impl Default for Settings {
             max_handshakes: 128,
             max_xudp_sessions: 32,
             queue_packets: 32,
+            max_xudp_associations: 1024,
+            xudp_resume_timeout_seconds: 60,
+            xudp_detached_packets: 8,
             max_users: 100_000,
             report_entries: 100_000,
             user_max_age_seconds: 900,
@@ -84,6 +90,7 @@ impl Settings {
             self.handshake_timeout_seconds,
             self.idle_timeout_seconds,
             self.udp_idle_timeout_seconds,
+            self.xudp_resume_timeout_seconds,
             self.drain_timeout_seconds,
             self.shutdown_timeout_seconds,
         ] {
@@ -111,6 +118,9 @@ impl Settings {
             udp_idle_timeout: Duration::from_secs(self.udp_idle_timeout_seconds),
             max_xudp_sessions: self.max_xudp_sessions,
             queue_packets: self.queue_packets,
+            max_xudp_associations: self.max_xudp_associations,
+            xudp_resume_timeout: Duration::from_secs(self.xudp_resume_timeout_seconds),
+            xudp_detached_packets: self.xudp_detached_packets,
             ..Default::default()
         })
     }

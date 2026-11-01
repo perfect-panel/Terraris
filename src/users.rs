@@ -122,11 +122,26 @@ impl fmt::Debug for Snapshot {
             .finish()
     }
 }
+/// Equality and hashing include the owning store and authentication epoch;
+/// the same numeric subscription ID in another scope is a different identity.
 #[derive(Clone)]
 pub struct Identity {
     owner: Arc<()>,
     id: SubscriptionId,
     epoch: u64,
+}
+impl PartialEq for Identity {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.owner, &other.owner) && self.id == other.id && self.epoch == other.epoch
+    }
+}
+impl Eq for Identity {}
+impl Hash for Identity {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.owner).hash(state);
+        self.id.hash(state);
+        self.epoch.hash(state);
+    }
 }
 impl Identity {
     pub fn id(&self) -> SubscriptionId {
@@ -449,6 +464,13 @@ impl Store {
         Ok(())
     }
 
+    /// Revalidate a previously authenticated identity without allocating a
+    /// connection lease. Shared dormant state uses this for revocation/expiry.
+    pub(crate) fn validate_identity(&self, identity: &Identity) -> Result<User, Error> {
+        let _guard = self.publication().read();
+        let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(self.resolve(&state, identity)?.user.clone())
+    }
     pub(crate) fn acquire(
         &self,
         permit: &ReadPermit<'_>,

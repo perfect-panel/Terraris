@@ -35,7 +35,15 @@ Terraris 是参考 Polaris 架构设计的 PPanel Rust 节点端项目，负责�
 - VLESS 实际驱动支持 UUID 多用户、TCP/UDP/XUDP、三种 VLESS Encryption 外观和 1-RTT/0-RTT；使用统一的限速、设备和计量策略。
 - 同端口候选共享 accept loop，失败更新保留活跃服务；相同加密设置的重载保留恢复票据。
 
-当前载体为 TCP；TLS、REALITY、Vision 等非默认组合会拒绝。XUDP 会话不通过 GlobalID 跨承载连接迁移。完整能力边界见 [VLESS 文档](docs/vless.md)。
+当前载体为 TCP；TLS、REALITY、Vision 等非默认组合会拒绝。非零 GlobalID 现可跨承载连接及兼容配置代次迁移，保留 UDP 出口 socket；恢复仍需用户和设备准入。完整能力边界见 [VLESS 文档](docs/vless.md)。
+
+## DNS、限速和路由现状
+
+| 模块 | 已实现 | 尚未实现 |
+| --- | --- | --- |
+| DNS | 系统解析、地址族策略、候选地址上限、受持有的并发任务与退出回收 | 独立 DNS 引擎、自定义服务器/规则、应用缓存、DoH/DoT |
+| 限速 | 按协议和订阅共享的 TCP/UDP、上下行额度；等待取消与未使用额度退还 | 跨节点全局带宽限制 |
+| 路由 | 直连出站及地址族策略 | block/分流规则编译、策略路由和代理出站；相应非空配置会拒绝 |
 
 ## Resource 和 Buffer 使用约定
 
@@ -159,7 +167,7 @@ cargo build --locked --release
 
 资源和 buffer 测试覆盖作用域聚合、混合批次与缓存淘汰、共享/Bytes 生命周期、关闭和取消竞态、零长度名额、溢出、封包边界，以及分配失败和 unwind 回滚。队列使用可控时间验证 FIFO、超时和授予/取消交错；Rustdoc 验证 BufferLease、QueuePermit 无法 Clone，SharedBuffer 不可写。
 
-B3 测试包含可控时钟下的任务关停/超时、短写和失败前缀计数、真实 IPv4 回环 TCP 半关闭与 UDP 包边界、超限夹具、分段 codec 输入及指标并发。B4 增加多协议提交回滚、旧响应/用户更新竞争、跨代次会话、调度、报告 ACK 和关闭测试。B5 增加协议边界、设备 TTL、共享限速、实际 TCP/UDP/XUDP、同端口重载和 CLI 退出测试；另有固定版本 Xray 外部测试。性能和生产部署仍需后续验证。
+B3 测试包含可控时钟下的任务关停/超时、短写和失败前缀计数、真实 IPv4 回环 TCP 半关闭与 UDP 包边界、超限夹具、分段 codec 输入及指标并发。B4 增加多协议提交回滚、旧响应/用户更新竞争、跨代次会话、调度、报告 ACK 和关闭测试。B5 增加协议边界、设备 TTL、共享限速、实际 TCP/UDP/XUDP、同端口重载、GlobalID 迁移/隔离/过期和 CLI 退出测试；另有固定版本 Xray 外部测试。性能和生产部署仍需后续验证。
 
 [CI 配置](.github/workflows/ci.yml) 在 Linux 和 macOS 上执行格式、Clippy、测试及 release 构建。当前本地验证不等于生产面板、Redis/PostgreSQL 或 Linux 部署联调。
 

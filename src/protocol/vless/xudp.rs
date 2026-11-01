@@ -196,10 +196,19 @@ fn decode_metadata(bytes: &[u8]) -> Result<Metadata, Error> {
         global_id,
     })
 }
-pub async fn write<W: AsyncWrite + Unpin + ?Sized>(
+pub(crate) async fn write_unflushed<W: AsyncWrite + Unpin + ?Sized>(
     writer: &mut W,
     metadata: &Metadata,
     payload: Option<&[u8]>,
+) -> Result<(), Error> {
+    write_progress(writer, metadata, payload, |_| {}).await
+}
+
+pub(crate) async fn write_progress<W: AsyncWrite + Unpin + ?Sized>(
+    writer: &mut W,
+    metadata: &Metadata,
+    payload: Option<&[u8]>,
+    mut accepted: impl FnMut(usize),
 ) -> Result<(), Error> {
     if metadata.status == Status::KeepAlive
         && (metadata.data
@@ -244,10 +253,88 @@ pub async fn write<W: AsyncWrite + Unpin + ?Sized>(
         bytes[end..end + 2].copy_from_slice(&(payload.len() as u16).to_be_bytes());
         end += 2;
         writer.write_all(&bytes[..end]).await?;
-        writer.write_all(payload).await?;
+        let mut offset = 0;
+        while offset < payload.len() {
+            let written = writer.write(&payload[offset..]).await?;
+            if written == 0 {
+                return Err(Error::Io(std::io::ErrorKind::WriteZero));
+            }
+            accepted(written);
+            offset += written;
+        }
     } else {
         writer.write_all(&bytes[..end]).await?;
     }
+    Ok(())
+}
+
+/// Write a complete frame and flush the transport. Accounting callers use the
+/// unflushed form to observe payload acceptance before a later flush can fail.
+pub async fn write<W: AsyncWrite + Unpin + ?Sized>(
+    writer: &mut W,
+    metadata: &Metadata,
+    payload: Option<&[u8]>,
+) -> Result<(), Error> {
+    write_unflushed(writer, metadata, payload).await?;
     writer.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+    struct PrefixWriter {
+        remaining: usize,
+        accepted: Vec<u8>,
+    }
+    impl AsyncWrite for PrefixWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.remaining == 0 {
+                return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+            }
+            let n = self.remaining.min(bytes.len());
+            self.remaining -= n;
+            self.accepted.extend_from_slice(&bytes[..n]);
+            Poll::Ready(Ok(n))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+    #[tokio::test]
+    async fn partial_payload_is_observable_before_a_later_failure() {
+        let mut writer = PrefixWriter {
+            remaining: 11,
+            accepted: vec![],
+        };
+        let metadata = Metadata {
+            id: 7,
+            status: Status::Keep,
+            data: true,
+            error: false,
+            target: None,
+            global_id: None,
+        };
+        let mut charged = 0;
+        assert!(
+            write_progress(&mut writer, &metadata, Some(b"abcdefghij"), |n| charged +=
+                n)
+            .await
+            .is_err()
+        );
+        assert_eq!(charged, 3);
+        assert_eq!(&writer.accepted[8..], b"abc");
+    }
 }
