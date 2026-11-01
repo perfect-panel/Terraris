@@ -51,6 +51,8 @@ TCP 字节流和 UDP 数据报分别建模。QUIC 流可以交付字节流接口
 
 `route` / `dns` / `outbound` 已实现独立模块并由公共 `egress` 接入 VLESS TCP/UDP/XUDP：顺序规则、GeoData、分域 DNS、缓存、DoH/DoT，以及直连/阻断/DNS/SOCKS5/HTTP/VLESS 出站。限速按协议/订阅共享。实现语义和当前范围见 [路由与 DNS](routing-dns.md)。
 
+协议、出站和字节流传输已有工厂注册表；Node 使用 `Supervisor<protocol::Registry>`，内置 VLESS、现有出站与 TCP/raw（含出站 TLS）通过注册表装配。新增实现不需要更改 Node、Supervisor 或路由的协议分派；接口与生命周期见 [注册表](registries.md)。
+
 以下是目标模块划分；当前已实现 `app`、`config`、`panel` 及 B1–B4 基础设施和控制面。B5 已引入 VLESS、flow、限速和设备执行器；其余目标模块按后续阶段实施：
 
 | 拟定 Rust 模块 | 职责 | Polaris 对应位置 |

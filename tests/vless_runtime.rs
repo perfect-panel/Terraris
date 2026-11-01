@@ -45,7 +45,7 @@ fn users() -> Value {
 }
 struct Node {
     panel: MockPanel,
-    supervisor: Arc<Supervisor<vless::Factory>>,
+    supervisor: Arc<Supervisor<terraris::protocol::Registry>>,
     address: SocketAddr,
     budget: Budget,
     factory: Arc<vless::Factory>,
@@ -77,11 +77,29 @@ impl Node {
         .await
     }
     async fn with_network(
+        configure: impl FnMut(&mut Value),
+        userlist: Value,
+        protocol_options: vless::Options,
+        dns: terraris::dns::Settings,
+        routing: terraris::route::Settings,
+    ) -> Self {
+        Self::with_transports(
+            configure,
+            userlist,
+            protocol_options,
+            dns,
+            routing,
+            Arc::new(terraris::transport::Registry::builtin()),
+        )
+        .await
+    }
+    async fn with_transports(
         mut configure: impl FnMut(&mut Value),
         userlist: Value,
         protocol_options: vless::Options,
         dns: terraris::dns::Settings,
         routing: terraris::route::Settings,
+        transports: Arc<terraris::transport::Registry>,
     ) -> Self {
         let address = unused().await;
         let mut value = config(address);
@@ -91,23 +109,34 @@ impl Node {
         options.wire_mode = WireMode::Json;
         let pins = options.fingerprints.clone();
         let connection: Arc<dyn Connection> = Arc::new(PPanelConnection::new(options).unwrap());
+        let egress = terraris::egress::Registry::with_providers(
+            dns,
+            routing,
+            protocol_options.max_connections,
+            Arc::new(terraris::outbound::Registry::builtin()),
+            transports.clone(),
+        )
+        .unwrap();
         let factory = Arc::new(
-            vless::Factory::with_network(
+            vless::Factory::with_services(
                 connection.clone(),
                 protocol_options,
                 flow::Options::default(),
-                dns,
-                routing,
+                egress.clone(),
+                transports,
                 Metrics::default(),
             )
             .unwrap(),
         );
+        let mut registry = terraris::protocol::Registry::builder(egress, Metrics::default());
+        registry.register("vless", &[], factory.clone()).unwrap();
+        let registry = Arc::new(registry.build().unwrap());
         let budget = Budget::new(Limits::new(32 << 20, 4096).unwrap());
         let buffers = BufferScope::new(budget.root_scope(), 128 << 10).unwrap();
         let supervisor = Arc::new(
             Supervisor::new(
                 connection,
-                factory.clone(),
+                registry,
                 buffers,
                 Options {
                     drain_timeout: Duration::from_secs(1),
@@ -1419,6 +1448,178 @@ async fn changed_policy_revokes_sessions_from_every_draining_generation() {
     drop(oldest);
     drop(previous);
     node.close().await;
+    echo.abort();
+    echo.await.ok();
+}
+
+// A transport plugin changes the bytes on the wire and carries generation-local
+// settings, while sharing the physical TCP listener across compatible reloads.
+struct MarkerTransport {
+    binds: Arc<std::sync::atomic::AtomicUsize>,
+    handshakes: Arc<std::sync::atomic::AtomicUsize>,
+}
+struct MarkerInbound {
+    binds: Arc<std::sync::atomic::AtomicUsize>,
+    handshakes: Arc<std::sync::atomic::AtomicUsize>,
+    key: String,
+    marker: u8,
+}
+impl terraris::transport::Factory for MarkerTransport {
+    fn inbound(
+        &self,
+        config: &terraris::panel::ProtocolConfig,
+    ) -> Result<Arc<dyn terraris::transport::Inbound>, terraris::transport::Error> {
+        Ok(Arc::new(MarkerInbound {
+            binds: self.binds.clone(),
+            handshakes: self.handshakes.clone(),
+            key: if config.path.is_empty() {
+                "marker.tcp".into()
+            } else {
+                config.path.clone()
+            },
+            marker: config.host.as_bytes().first().copied().unwrap_or(b'a'),
+        }))
+    }
+    fn outbound(
+        &self,
+        _: &terraris::panel::Outbound,
+        _: Arc<rustls::ClientConfig>,
+    ) -> Result<Arc<dyn terraris::transport::Outbound>, terraris::transport::Error> {
+        Err(terraris::transport::Error::Unsupported)
+    }
+}
+#[async_trait::async_trait]
+impl terraris::transport::Inbound for MarkerInbound {
+    fn binding_key(&self) -> &str {
+        &self.key
+    }
+    async fn bind(
+        &self,
+        address: SocketAddr,
+        context: &OperationContext,
+    ) -> Result<Box<dyn terraris::transport::Listener>, terraris::transport::Error> {
+        self.binds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        terraris::transport::Tcp.bind(address, context).await
+    }
+    async fn handshake(
+        &self,
+        mut stream: terraris::network::Stream,
+        _: &BufferScope,
+        context: &OperationContext,
+    ) -> Result<terraris::network::Stream, terraris::transport::Error> {
+        self.handshakes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let marker = context
+            .run(stream.read_u8())
+            .await
+            .map_err(terraris::transport::Error::Stopped)??;
+        if marker != self.marker {
+            return Err(terraris::transport::Error::Configuration("marker"));
+        }
+        Ok(stream)
+    }
+}
+async fn marker_connect(node: &Node, target: SocketAddr, marker: u8) -> TcpStream {
+    let mut stream = TcpStream::connect(node.address).await.unwrap();
+    stream.write_u8(marker).await.unwrap();
+    wire::Request {
+        uuid: *uuid::Uuid::parse_str(UUID1).unwrap().as_bytes(),
+        command: wire::Command::Tcp,
+        target: Some(Address::from_socket(target).unwrap()),
+    }
+    .write(&mut stream)
+    .await
+    .unwrap();
+    let mut response = [0; 2];
+    tokio::time::timeout(Duration::from_secs(3), stream.read_exact(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response, [0, 0]);
+    stream
+}
+fn marker_config(address: SocketAddr, marker: &str, key: &str) -> Value {
+    let mut value = config(address);
+    value["data"]["protocols"][0]["network"] = json!("marker");
+    value["data"]["protocols"][0]["transport"] = json!("marked");
+    value["data"]["protocols"][0]["host"] = json!(marker);
+    value["data"]["protocols"][0]["path"] = json!(key);
+    value
+}
+#[tokio::test]
+async fn registered_transport_drives_handshake_reuses_binding_and_rolls_back_incompatible_change() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let binds = Arc::new(AtomicUsize::new(0));
+    let handshakes = Arc::new(AtomicUsize::new(0));
+    let mut transports = terraris::transport::Registry::builtin_builder();
+    transports
+        .register(
+            "marker",
+            &["marked"],
+            Arc::new(MarkerTransport {
+                binds: binds.clone(),
+                handshakes: handshakes.clone(),
+            }),
+        )
+        .unwrap();
+    let node = Node::with_transports(
+        |value| {
+            value["data"]["protocols"][0]["network"] = json!("marker");
+            value["data"]["protocols"][0]["transport"] = json!("marked");
+        },
+        users(),
+        vless::Options {
+            listen: Ipv4Addr::LOCALHOST.into(),
+            ..Default::default()
+        },
+        terraris::dns::Settings::default(),
+        terraris::route::Settings::default(),
+        Arc::new(transports.build()),
+    )
+    .await;
+    let (target, echo) = echo().await;
+    let mut first = marker_connect(&node, target, b'a').await;
+    exchange(&mut first, b"initial").await;
+    let before = node.supervisor.snapshot().generation;
+    node.panel.push(Reply::json(marker_config(
+        node.address,
+        "b",
+        "incompatible",
+    )));
+    node.panel.push(Reply::json(users()));
+    assert!(node.supervisor.sync_config(&ctx()).await.is_err());
+    assert_eq!(node.supervisor.snapshot().generation, before);
+    exchange(&mut first, b"kept").await;
+    let mut retained = marker_connect(&node, target, b'a').await;
+    exchange(&mut retained, b"still accepts old marker").await;
+    node.panel
+        .push(Reply::json(marker_config(node.address, "b", "")));
+    node.panel.push(Reply::json(users()));
+    node.supervisor.sync_config(&ctx()).await.unwrap();
+    let mut second = marker_connect(&node, target, b'b').await;
+    exchange(&mut second, b"new handshake settings").await;
+    exchange(&mut first, b"old stream drains").await;
+    assert_eq!(binds.load(Ordering::SeqCst), 1);
+    assert_eq!(handshakes.load(Ordering::SeqCst), 3);
+    // Shutdown must also cancel an unfinished transport handshake.
+    let mut pending = TcpStream::connect(node.address).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while handshakes.load(Ordering::SeqCst) != 4 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(first);
+    drop(retained);
+    drop(second);
+    node.close().await;
+    let mut bytes = [0];
+    let result = tokio::time::timeout(Duration::from_secs(2), pending.read(&mut bytes))
+        .await
+        .unwrap();
+    assert!(result.is_err() || result.unwrap() == 0);
+    assert!(TcpListener::bind(node.address).await.is_ok());
     echo.abort();
     echo.await.ok();
 }

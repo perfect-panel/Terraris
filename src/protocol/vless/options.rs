@@ -75,20 +75,19 @@ impl Options {
 pub(super) fn validate(
     config: &ProtocolConfig,
     options: &Options,
+    secure_transport: bool,
 ) -> Result<Option<encryption::Config>, Error> {
-    if config.protocol.as_str() != "vless"
-        || config.port == 0
-        || !matches!(config.network.as_str(), "" | "tcp" | "raw")
-        || !matches!(config.transport.as_str(), "" | "tcp" | "raw")
-        || !matches!(config.security.as_str(), "" | "none")
-        || !matches!(config.cert_mode.as_str(), "" | "none")
-    {
+    if config.port == 0 {
         return Err(Error::Unsupported);
     }
     reject_extra(config)?;
     let encryption = encryption::Config::from_panel(config)
         .map_err(|_| Error::Preparation("VLESS encryption settings"))?;
-    if encryption.is_none() && !options.allow_plaintext && !options.listen.is_loopback() {
+    if encryption.is_none()
+        && !secure_transport
+        && !options.allow_plaintext
+        && !options.listen.is_loopback()
+    {
         return Err(Error::Preparation(
             "unencrypted VLESS requires trusted local transport or explicit allow_plaintext",
         ));
@@ -99,18 +98,6 @@ pub(super) fn validate(
 fn reject_extra(config: &ProtocolConfig) -> Result<(), Error> {
     if config.version != 0
         || !config.mode.is_empty()
-        || !config.sni.is_empty()
-        || !config.alpn.is_empty()
-        || config.allow_insecure
-        || !config.fingerprint.is_empty()
-        || !config.reality_server_addr.is_empty()
-        || config.reality_server_port != 0
-        || !config.reality_private_key.expose().is_empty()
-        || !config.reality_public_key.is_empty()
-        || !config.reality_short_id.is_empty()
-        || !config.host.is_empty()
-        || !config.path.is_empty()
-        || !config.service_name.is_empty()
         || !config.cipher.is_empty()
         || !config.server_key.expose().is_empty()
         || !config.plugin.is_empty()
@@ -118,11 +105,9 @@ fn reject_extra(config: &ProtocolConfig) -> Result<(), Error> {
         || !config.flow.is_empty()
         || config.uot
         || config.uot_version != 0
-        || config.accept_proxy_protocol
         || !config.hop_ports.is_empty()
         || config.hop_interval != 0
         || !config.obfs_password.expose().is_empty()
-        || config.disable_sni
         || config.reduce_rtt
         || config.heartbeat != 0
         || !config.udp_relay_mode.is_empty()
@@ -140,12 +125,6 @@ fn reject_extra(config: &ProtocolConfig) -> Result<(), Error> {
         || !config.obfs_param.is_empty()
         || !config.obfs_host.is_empty()
         || !config.obfs_path.is_empty()
-        || !config.xhttp_mode.is_empty()
-        || !config.xhttp_extra.is_empty()
-        || config.ech_enable
-        || !config.ech_server_name.is_empty()
-        || !config.cert_dns_provider.is_empty()
-        || !config.cert_dns_env.expose().is_empty()
         || !config.extensions.is_empty()
     {
         return Err(Error::Unsupported);

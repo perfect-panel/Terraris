@@ -90,6 +90,19 @@ impl Table {
         catalog: &mut geodata::Catalog,
         limits: &Limits,
     ) -> Result<Self, Error> {
+        Self::compile_with_registry(
+            config,
+            catalog,
+            limits,
+            &crate::outbound::Registry::builtin(),
+        )
+    }
+    pub fn compile_with_registry(
+        config: &ServerConfig,
+        catalog: &mut geodata::Catalog,
+        limits: &Limits,
+        outbounds: &crate::outbound::Registry,
+    ) -> Result<Self, Error> {
         limits.validate()?;
         if config.outbounds.len().saturating_add(1) > limits.max_rules {
             return Err(Error::Limit("rules"));
@@ -104,13 +117,10 @@ impl Table {
         }
         let mut names = HashSet::new();
         for (index, outbound) in config.outbounds.iter().enumerate() {
-            let target = match outbound.protocol.as_str() {
-                "direct" | "freedom" => Target::Direct,
-                "block" | "reject" | "blackhole" => Target::Block,
-                "dns" => Target::Dns,
-                "socks" | "socks5" | "http" | "vless" => Target::Proxy(index),
-                _ => return Err(Error::Outbound("unsupported protocol")),
-            };
+            let target = outbounds
+                .kind(outbound.protocol.as_str())
+                .map_err(|_| Error::Outbound("unsupported protocol"))?
+                .target(index);
             let name = outbound.name.trim();
             if name.is_empty() || name.len() > 256 || name.chars().any(char::is_control) {
                 return Err(Error::Outbound("invalid name"));

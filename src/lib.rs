@@ -15,6 +15,7 @@ pub mod node;
 pub mod outbound;
 pub mod panel;
 pub mod protocol;
+pub mod registry;
 pub mod reports;
 pub mod resource;
 pub mod route;
@@ -24,6 +25,7 @@ pub mod supervisor;
 pub mod task;
 pub mod telemetry;
 pub mod time;
+pub mod transport;
 pub mod users;
 
 #[cfg(test)]

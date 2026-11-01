@@ -118,8 +118,27 @@ pub async fn run() -> Result<(), Error> {
             println!(
                 "infrastructure: tracked tasks, monotonic deadlines, budgeted TCP/UDP I/O, bounded codecs, metrics"
             );
-            println!("proxy protocols: vless (TCP, UDP, XUDP; mlkem768x25519plus)");
-            println!("transports: TCP; encryption native/xorpub/random, 1-RTT/0-RTT");
+            println!(
+                "proxy protocols: {} (TCP, UDP, XUDP; mlkem768x25519plus)",
+                crate::protocol::vless::NAME
+            );
+            println!(
+                "transports: {} (raw alias; inbound/outbound), TLS client layer; VLESS encryption native/xorpub/random, 1-RTT/0-RTT",
+                crate::transport::Registry::builtin()
+                    .names()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            println!(
+                "outbound registry: {}",
+                crate::outbound::Registry::builtin()
+                    .names()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            println!(
+                "registries: immutable protocol/outbound/stream factories; startup aliases and custom providers"
+            );
             println!(
                 "routing: ordered domain/IP/GeoSite/GeoIP rules; direct/block/DNS/SOCKS5/HTTP/VLESS outbounds"
             );

@@ -7,7 +7,7 @@ use crate::{
     },
     dns::{self, Resolver, Strategy},
     network::{self, Address, Network, Stream},
-    outbound::{self, Packet, PacketPort, Proxy},
+    outbound::{self, Connector, Packet, PacketPort},
     panel::{Outbound, ServerConfig},
     route::{
         self, Decision, Table, Target,
@@ -68,12 +68,29 @@ pub struct Registry {
     dns: dns::Settings,
     routing: route::Settings,
     task_limit: usize,
+    outbounds: Arc<outbound::Registry>,
+    transports: Arc<crate::transport::Registry>,
 }
 impl Registry {
     pub fn new(
         dns: dns::Settings,
         routing: route::Settings,
         task_limit: usize,
+    ) -> Result<Arc<Self>, Error> {
+        Self::with_providers(
+            dns,
+            routing,
+            task_limit,
+            Arc::new(outbound::Registry::builtin()),
+            Arc::new(crate::transport::Registry::builtin()),
+        )
+    }
+    pub fn with_providers(
+        dns: dns::Settings,
+        routing: route::Settings,
+        task_limit: usize,
+        outbounds: Arc<outbound::Registry>,
+        transports: Arc<crate::transport::Registry>,
     ) -> Result<Arc<Self>, Error> {
         dns.validate().map_err(Error::Dns)?;
         routing
@@ -90,6 +107,8 @@ impl Registry {
             dns,
             routing,
             task_limit,
+            outbounds,
+            transports,
         }))
     }
     pub async fn open(
@@ -107,14 +126,7 @@ impl Registry {
             return Err(Error::Closed);
         }
         self.reap();
-        let candidate = Arc::new(Engine::compile(
-            config,
-            &self.dns,
-            &self.routing,
-            buffers,
-            metrics,
-            self.task_limit,
-        )?);
+        let candidate = Arc::new(Engine::compile(config, self, buffers, metrics)?);
         context.check().map_err(Error::Stopped)?;
         let mut engines = self.engines.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(current) = engines
@@ -278,7 +290,7 @@ struct Engine {
     table: Arc<Table>,
     strategy: Strategy,
     dns: Arc<Resolver>,
-    proxies: Vec<Option<Arc<Proxy>>>,
+    proxies: Vec<Option<Arc<dyn Connector>>>,
     stamps: Mutex<Vec<Stamp>>,
     metrics: Metrics,
     cancel: CancellationToken,
@@ -288,16 +300,14 @@ struct Engine {
 impl Engine {
     fn compile(
         config: &ServerConfig,
-        dns_settings: &dns::Settings,
-        routing: &route::Settings,
+        services: &Registry,
         scope: BufferScope,
         metrics: Metrics,
-        task_limit: usize,
     ) -> Result<Self, Error> {
-        let active = config
-            .protocols
-            .iter()
-            .any(|p| p.enabled && p.protocol.as_str() == "vless");
+        let dns_settings = &services.dns;
+        let routing = &services.routing;
+        let outbounds = &services.outbounds;
+        let active = config.protocols.iter().any(|p| p.enabled);
         let mut normalized = config.clone();
         if !active {
             normalized.dns.clear();
@@ -312,7 +322,7 @@ impl Engine {
         let strategy = Strategy::parse(&normalized.ip_strategy).map_err(Error::Dns)?;
         let mut catalog = Catalog::new(routing.assets());
         let table = Arc::new(
-            Table::compile(&normalized, &mut catalog, &routing.limits)
+            Table::compile_with_registry(&normalized, &mut catalog, &routing.limits, outbounds)
                 .map_err(|_| Error::Configuration("route rules"))?,
         );
         let effective_dns = if active {
@@ -344,25 +354,30 @@ impl Engine {
         )
         .map_err(Error::Dns)?;
         let mut proxies = Vec::new();
+        let outbound_context = outbound::registry::Context {
+            tls,
+            system: dns.system(),
+            transports: services.transports.clone(),
+        };
         for outbound in &normalized.outbounds {
-            let proxy = match outbound.protocol.as_str() {
-                "direct" | "freedom" | "block" | "blackhole" | "reject" | "dns" => {
-                    validate_builtin(outbound)?;
-                    if outbound.protocol.as_str() == "dns" && !dns.available() {
-                        return Err(Error::Configuration("DNS outbound needs a resolver"));
-                    }
-                    None
-                }
-                _ => Some(Arc::new(
-                    Proxy::compile(outbound, tls.clone(), dns.system()).map_err(Error::Outbound)?,
-                )),
-            };
-            proxies.push(proxy);
+            if outbounds
+                .kind(outbound.protocol.as_str())
+                .map_err(Error::Outbound)?
+                == outbound::registry::Kind::Dns
+                && !dns.available()
+            {
+                return Err(Error::Configuration("DNS outbound needs a resolver"));
+            }
+            proxies.push(
+                outbounds
+                    .compile(outbound, &outbound_context)
+                    .map_err(Error::Outbound)?,
+            );
         }
         let stamps = catalog.stamps();
         let hash = fingerprint(&normalized, &stamps, strategy);
         let cancel = CancellationToken::new();
-        let jobs = TaskGroup::new(&cancel, task_limit, metrics.clone())
+        let jobs = TaskGroup::new(&cancel, services.task_limit, metrics.clone())
             .map_err(|_| Error::Configuration("service tasks"))?;
         Ok(Self {
             hash,
@@ -419,8 +434,10 @@ impl Engine {
         if decision.rule.is_none() && target.port() == 53 && self.dns.intercept() {
             decision.target = Target::Dns;
         }
-        if network == Network::Udp
-            && matches!(decision.target,Target::Proxy(index) if self.proxies[index].as_ref().is_some_and(|p|p.kind==crate::outbound::Kind::Http))
+        if let Target::Proxy(index) = decision.target
+            && !self.proxies[index]
+                .as_ref()
+                .is_some_and(|proxy| proxy.supports(network))
         {
             return Err(Error::Outbound(outbound::Error::Unsupported));
         }
@@ -865,49 +882,4 @@ fn hash_outbound(hash: &mut Sha256, value: &Outbound) {
     for item in &value.rules {
         field(hash, item.as_bytes());
     }
-}
-fn validate_builtin(value: &Outbound) -> Result<(), Error> {
-    if !value.address.is_empty()
-        || value.port != 0
-        || !value.user.is_empty()
-        || !value.password.expose().is_empty()
-        || !value.uuid.expose().is_empty()
-        || !value.cipher.is_empty()
-        || !value.plugin.is_empty()
-        || value.plugin_options != crate::panel::ConfigValue::Null
-        || !value.security.is_empty()
-        || !value.sni.is_empty()
-        || !value.alpn.is_empty()
-        || value.allow_insecure
-        || !value.fingerprint.is_empty()
-        || !value.transport.is_empty()
-        || !value.host.is_empty()
-        || !value.path.is_empty()
-        || !value.service_name.is_empty()
-        || !value.xhttp_mode.is_empty()
-        || !value.xhttp_extra.is_empty()
-        || !value.flow.is_empty()
-        || !value.encryption.is_empty()
-        || !value.encryption_mode.is_empty()
-        || !value.encryption_rtt.is_empty()
-        || !value.encryption_ticket.expose().is_empty()
-        || !value.encryption_client_padding.is_empty()
-        || !value.encryption_password.expose().is_empty()
-        || !value.multiplex.is_empty()
-        || value.uot
-        || value.uot_version != 0
-        || !value.congestion_controller.is_empty()
-        || value.udp_stream
-        || value.reduce_rtt
-        || value.heartbeat != 0
-        || !value.reality_public_key.is_empty()
-        || !value.reality_short_id.is_empty()
-        || !value.spider_x.is_empty()
-        || !value.settings.is_empty()
-        || !value.stream_settings.is_empty()
-        || !value.extensions.is_empty()
-    {
-        return Err(Error::Configuration("unused builtin outbound fields"));
-    }
-    Ok(())
 }

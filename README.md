@@ -10,6 +10,7 @@ Terraris 是参考 Polaris 架构设计的 PPanel Rust 节点端项目，负责�
 - [Buffer 系统设计](docs/buffer.md)：所有权、前后预留空间、共享切片、内存预算、池化和背压。
 - [B4 控制面与运行时](docs/control-plane.md)：事务提交、准入、代次切换、维护调度、报告与退出。
 - [B5 VLESS 接入](docs/vless.md)：当前协议组合、Encryption 参数、运行方式和 Xray 互通复现。
+- [协议与传输注册表](docs/registries.md)：工厂扩展、别名、内置实现与热重载生命周期。
 - [路由、DNS 与代理出站](docs/routing-dns.md)：规则语义、GeoData、解析缓存、DoH/DoT、重载与验证。
 
 设计沿用 Polaris 的 `panel → supervisor/controller → protocol` 分层，以 `runtimekit` 统一运行时生命周期、以 `flow` 统一数据面策略。采用单进程、多协议结构，优先面向 Linux x86_64 和 aarch64。Rust 负责节点控制与协议集成；候选协议库必须能接入统一的用户策略、连接管理和流量计量。
@@ -33,6 +34,7 @@ Terraris 是参考 Polaris 架构设计的 PPanel Rust 节点端项目，负责�
 - Controller/Supervisor 提供配置与用户同步、候选回滚、跨代次共享状态、退役清理、可选主机状态采样与指纹发布。
 - Reports 提供有上限的内存流量/在线状态、批次确认和最终冲刷；进程重启不保留，面板 ACK 丢失仍有重复计费风险。
 
+- protocol/outbound/transport 提供不可变工厂注册表；启动时注册和验证别名，Node 经注册表装配，支持自定义协议与流载体。
 - VLESS 实际驱动支持 UUID 多用户、TCP/UDP/XUDP、三种 VLESS Encryption 外观和 1-RTT/0-RTT；使用统一的限速、设备和计量策略。
 - 同端口候选共享 accept loop，失败更新保留活跃服务；相同加密设置的重载保留恢复票据。
 

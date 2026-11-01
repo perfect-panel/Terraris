@@ -1319,3 +1319,205 @@ async fn identity_hashes_include_store_scope_and_authentication_epoch() {
     identities.insert(next);
     assert_eq!(identities.len(), 3);
 }
+
+struct RegisteredProvider {
+    state: Arc<FactoryState>,
+    prepares: Mutex<Vec<(ProtocolName, [u8; 32])>>,
+    publications: AtomicUsize,
+    aborts: AtomicUsize,
+    closes: AtomicUsize,
+    fail_close: bool,
+}
+impl RegisteredProvider {
+    fn new(fail_close: bool) -> Arc<Self> {
+        Arc::new(Self {
+            state: Arc::new(FactoryState::default()),
+            prepares: Mutex::new(Vec::new()),
+            publications: AtomicUsize::new(0),
+            aborts: AtomicUsize::new(0),
+            closes: AtomicUsize::new(0),
+            fail_close,
+        })
+    }
+}
+#[async_trait]
+impl crate::protocol::InboundFactory for RegisteredProvider {
+    fn abort(&self) {
+        self.aborts.fetch_add(1, Ordering::SeqCst);
+    }
+    async fn close(&self, _: &OperationContext) -> Result<(), runtime::Error> {
+        self.closes.fetch_add(1, Ordering::SeqCst);
+        if self.fail_close {
+            Err(runtime::Error::Preparation("injected close"))
+        } else {
+            Ok(())
+        }
+    }
+    fn published(&self, _: &crate::egress::Handle) {
+        self.publications.fetch_add(1, Ordering::SeqCst);
+    }
+    async fn prepare(
+        &self,
+        config: ProtocolConfig,
+        shared: Arc<crate::egress::Handle>,
+        core: Core,
+        context: &OperationContext,
+    ) -> Result<Arc<dyn ProtocolDriver>, runtime::Error> {
+        assert_eq!(core.protocol(), &config.protocol);
+        self.prepares
+            .lock()
+            .unwrap()
+            .push((config.protocol.clone(), shared.migration_scope()));
+        Factory(self.state.clone())
+            .prepare_protocol(config, Arc::new(Shared(self.state.clone())), core, context)
+            .await
+    }
+}
+fn registry_egress() -> Arc<crate::egress::Registry> {
+    crate::egress::Registry::new(
+        crate::dns::Settings::default(),
+        crate::route::Settings::default(),
+        16,
+    )
+    .unwrap()
+}
+#[tokio::test]
+async fn protocol_registry_dispatches_aliases_and_rolls_back_all_providers() {
+    let alpha = RegisteredProvider::new(false);
+    let zeta = RegisteredProvider::new(false);
+    let mut builder = crate::protocol::Registry::builder(registry_egress(), Metrics::default());
+    builder
+        .register("Alpha", &["first"], alpha.clone())
+        .unwrap();
+    assert!(matches!(
+        builder.register("new", &["FIRST"], zeta.clone()),
+        Err(crate::registry::Error::Duplicate)
+    ));
+    builder.register("zeta", &[], zeta.clone()).unwrap();
+    let registry = Arc::new(builder.build().unwrap());
+    assert_eq!(registry.names().collect::<Vec<_>>(), ["alpha", "zeta"]);
+    assert!(!registry.supports(&name("new")));
+    let panel = PanelState::new(config(&["first", "zeta", "unknown"], 1));
+    let budget = Budget::new(Limits::new(16 << 20, 1024).unwrap());
+    let buffers = BufferScope::new(budget.root_scope(), 128 << 10).unwrap();
+    let supervisor = Arc::new(
+        Supervisor::new(
+            Arc::new(ConnectionMock(panel.clone())),
+            registry.clone(),
+            buffers,
+            supervisor::Options::default(),
+            Metrics::default(),
+            Arc::new(Fingerprints::default()),
+            None,
+        )
+        .unwrap(),
+    );
+    supervisor.sync_config(&ctx()).await.unwrap();
+    assert_eq!(supervisor.snapshot().protocols.len(), 2);
+    assert!(supervisor.snapshot().ready);
+    let ap = alpha.prepares.lock().unwrap()[0].clone();
+    let zp = zeta.prepares.lock().unwrap()[0].clone();
+    assert_eq!(ap.0, name("first"));
+    assert_eq!(zp.0, name("zeta"));
+    assert_eq!(ap.1, zp.1);
+    assert_eq!(alpha.publications.load(Ordering::SeqCst), 1);
+    let before = supervisor.snapshot().generation;
+    let old = supervisor.runtime(&name("first")).unwrap();
+    *zeta.state.listener_failure.lock().unwrap() = Some(name("zeta"));
+    panel.config(config(&["first", "zeta"], 2));
+    assert!(supervisor.sync_config(&ctx()).await.is_err());
+    assert_eq!(supervisor.snapshot().generation, before);
+    assert!(old.core().is_current());
+    assert_eq!(alpha.publications.load(Ordering::SeqCst), 1);
+    for provider in [&alpha, &zeta] {
+        let drivers = provider.state.drivers.lock().unwrap();
+        assert!(drivers[1].aborted.load(Ordering::SeqCst));
+        assert!(!drivers[0].aborted.load(Ordering::SeqCst));
+    }
+    *zeta.state.listener_failure.lock().unwrap() = None;
+    let mut invalid = config(&["first", "zeta"], 3);
+    invalid.ip_strategy = "invalid-strategy".into();
+    panel.config(invalid);
+    assert!(supervisor.sync_config(&ctx()).await.is_err());
+    assert_eq!(supervisor.snapshot().generation, before);
+    // A cancelled candidate must preserve both old runtimes as well.
+    panel.config(config(&["first", "zeta"], 4));
+    let block = Arc::new(Block::default());
+    *zeta.state.prepare_block.lock().unwrap() = Some(block.clone());
+    let cancel = CancellationToken::new();
+    let operation = OperationContext::new(cancel.clone(), None);
+    let sync = supervisor.sync_config(&operation);
+    tokio::pin!(sync);
+    tokio::select! { result = &mut sync => panic!("unexpected: {result:?}"), _ = block.entered.notified() => {} }
+    cancel.cancel();
+    assert!(sync.await.is_err());
+    assert_eq!(supervisor.snapshot().generation, before);
+    assert!(old.core().is_current());
+    panel.config(config(&["unknown"], 5));
+    assert!(supervisor.sync_config(&ctx()).await.is_err());
+    assert_eq!(supervisor.snapshot().generation, before);
+    panel.config(config(&["first", "zeta"], 6));
+    supervisor.sync_config(&ctx()).await.unwrap();
+    assert_ne!(supervisor.snapshot().generation, before);
+    supervisor.close(&ctx()).await.unwrap();
+    assert!(alpha.aborts.load(Ordering::SeqCst) > 0);
+    assert!(zeta.aborts.load(Ordering::SeqCst) > 0);
+    assert!(alpha.closes.load(Ordering::SeqCst) > 0);
+    assert!(zeta.closes.load(Ordering::SeqCst) > 0);
+}
+#[tokio::test]
+async fn protocol_registry_closes_remaining_providers_and_shared_services_after_failure() {
+    let alpha = RegisteredProvider::new(true);
+    let zeta = RegisteredProvider::new(false);
+    let egress = registry_egress();
+    let mut builder = crate::protocol::Registry::builder(egress.clone(), Metrics::default());
+    builder
+        .register("alpha", &["alias"], alpha.clone())
+        .unwrap();
+    builder.register("zeta", &[], zeta.clone()).unwrap();
+    let registry = builder.build().unwrap();
+    assert!(registry.close(&ctx()).await.is_err());
+    assert_eq!(alpha.closes.load(Ordering::SeqCst), 1);
+    assert_eq!(zeta.closes.load(Ordering::SeqCst), 1);
+    assert_eq!(alpha.aborts.load(Ordering::SeqCst), 1); // alias is not a second owner
+    let budget = Budget::new(Limits::new(16 << 20, 1024).unwrap());
+    let buffers = BufferScope::new(budget.root_scope(), 128 << 10).unwrap();
+    assert!(matches!(
+        egress
+            .open(&config(&["alpha"], 0), buffers, Metrics::default(), &ctx())
+            .await,
+        Err(crate::egress::Error::Closed)
+    ));
+}
+
+#[test]
+fn transport_registry_validates_aliases_conflicts_and_tcp_security_before_binding() {
+    use crate::transport::{Error, Registry, Tcp};
+    let mut builder = Registry::builtin_builder();
+    builder.register("other", &[], Arc::new(Tcp)).unwrap();
+    let registry = builder.build();
+    let mut config = protocol("vless", 12345, 0);
+    assert!(registry.inbound(&config).is_ok());
+    config.network = "tcp".into();
+    config.transport = "raw".into();
+    assert!(registry.inbound(&config).is_ok());
+    config.transport = "other".into();
+    assert!(matches!(
+        registry.inbound(&config),
+        Err(Error::Configuration("conflicting transport selections"))
+    ));
+    config.transport = "unregistered".into();
+    assert!(matches!(registry.inbound(&config), Err(Error::Unsupported)));
+    config.transport = "tcp".into();
+    config.security = "tls".into();
+    assert!(matches!(registry.inbound(&config), Err(Error::Unsupported)));
+    config.security.clear();
+    config.host = "unused-host".into();
+    assert!(matches!(registry.inbound(&config), Err(Error::Unsupported)));
+    config.host.clear();
+    config.accept_proxy_protocol = true;
+    assert!(matches!(registry.inbound(&config), Err(Error::Unsupported)));
+    config.accept_proxy_protocol = false;
+    config.cert_mode = "file".into();
+    assert!(matches!(registry.inbound(&config), Err(Error::Unsupported)));
+}

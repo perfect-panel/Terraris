@@ -20,10 +20,7 @@ use std::{
     sync::Arc,
     task::{Context, Poll},
 };
-use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
-    net::TcpStream,
-};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Socks5,
@@ -37,23 +34,16 @@ pub struct Proxy {
     user: String,
     password: Secret,
     uuid: Option<[u8; 16]>,
-    tls: Option<Arc<rustls::ClientConfig>>,
-    server_name: String,
+    transport: Arc<dyn crate::transport::Outbound>,
     encryption: Option<Arc<encryption::Client>>,
     system: Arc<System>,
 }
 impl Proxy {
-    pub fn compile(
+    pub(crate) fn compile_kind(
+        kind: Kind,
         config: &Outbound,
-        tls: Arc<rustls::ClientConfig>,
-        system: Arc<System>,
+        context: &super::registry::Context,
     ) -> Result<Self, Error> {
-        let kind = match config.protocol.as_str() {
-            "socks" | "socks5" => Kind::Socks5,
-            "http" => Kind::Http,
-            "vless" => Kind::Vless,
-            _ => return Err(Error::Unsupported),
-        };
         validate_extra(config)?;
         if config.address.is_empty() || config.address.len() > 253 || config.port == 0 {
             return Err(Error::Configuration("proxy endpoint"));
@@ -63,47 +53,16 @@ impl Proxy {
             Address::from_domain(&host, config.port)
                 .map_err(|_| Error::Configuration("proxy hostname"))?;
         }
-        let tls = match config.security.as_str() {
-            "" | "none" => {
-                if !config.sni.is_empty() || !config.alpn.is_empty() || config.allow_insecure {
-                    return Err(Error::Configuration("TLS options without TLS"));
-                }
-                None
+        let mut transport_config = config.clone();
+        if kind == Kind::Http && config.security == "tls" {
+            if config.alpn.iter().any(|value| value != "http/1.1") {
+                return Err(Error::Unsupported);
             }
-            "tls" => {
-                let mut tls = (*tls).clone();
-                if kind == Kind::Http {
-                    if config.alpn.iter().any(|value| value != "http/1.1") {
-                        return Err(Error::Unsupported);
-                    }
-                    tls.alpn_protocols = vec![b"http/1.1".to_vec()];
-                } else {
-                    if config.alpn.len() > 16
-                        || config.alpn.iter().any(|v| v.is_empty() || v.len() > 255)
-                    {
-                        return Err(Error::Configuration("ALPN"));
-                    }
-                    tls.alpn_protocols =
-                        config.alpn.iter().map(|v| v.as_bytes().to_vec()).collect();
-                }
-                if config.allow_insecure {
-                    tls.dangerous().set_certificate_verifier(Arc::new(Insecure {
-                        provider: rustls::crypto::aws_lc_rs::default_provider(),
-                    }));
-                }
-                Some(Arc::new(tls))
-            }
-            _ => return Err(Error::Unsupported),
-        };
-        let server_name = if config.sni.is_empty() {
-            host.clone()
-        } else {
-            config.sni.clone()
-        };
-        if tls.is_some() {
-            rustls::pki_types::ServerName::try_from(server_name.clone())
-                .map_err(|_| Error::Configuration("TLS server name"))?;
+            transport_config.alpn = vec!["http/1.1".into()];
         }
+        let transport = context
+            .transports
+            .outbound(&transport_config, context.tls.clone())?;
         let (uuid, encryption) = if kind == Kind::Vless {
             if !config.user.is_empty() || !config.password.expose().is_empty() {
                 return Err(Error::Unsupported);
@@ -140,10 +99,9 @@ impl Proxy {
             user: config.user.clone(),
             password: config.password.clone(),
             uuid,
-            tls,
-            server_name,
+            transport,
             encryption,
-            system,
+            system: context.system.clone(),
         })
     }
     async fn transport(
@@ -156,37 +114,11 @@ impl Proxy {
             .lookup(&self.host, context)
             .await
             .map_err(|_| Error::Resolve)?;
-        let mut socket = None;
-        for ip in ips {
-            if let Ok(value) = context
-                .run(TcpStream::connect(SocketAddr::new(ip, self.port)))
-                .await
-                .map_err(Error::Stopped)?
-            {
-                socket = Some(value);
-                break;
-            }
-        }
-        let socket = socket.ok_or(Error::Io(io::ErrorKind::ConnectionRefused))?;
-        let peer = crate::network::canonical_socket(socket.peer_addr()?);
-        let stream: Stream = if let Some(tls) = &self.tls {
-            let connector = tokio_rustls::TlsConnector::from(tls.clone());
-            Box::new(
-                context
-                    .run(
-                        connector.connect(
-                            rustls::pki_types::ServerName::try_from(self.server_name.clone())
-                                .map_err(|_| Error::Tls)?,
-                            socket,
-                        ),
-                    )
-                    .await
-                    .map_err(Error::Stopped)?
-                    .map_err(|_| Error::Tls)?,
-            )
-        } else {
-            Box::new(socket)
-        };
+        let addresses = ips
+            .into_iter()
+            .map(|ip| SocketAddr::new(ip, self.port))
+            .collect::<Vec<_>>();
+        let (stream, peer) = self.transport.connect(&addresses, scope, context).await?;
         let stream: Stream = if let Some(encryption) = &self.encryption {
             Box::new(
                 Box::pin(encryption.handshake(stream, scope, context))
@@ -549,65 +481,10 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ResponseStream<S> {
         Pin::new(&mut self.get_mut().io).poll_shutdown(cx)
     }
 }
-#[derive(Debug)]
-struct Insecure {
-    provider: rustls::crypto::CryptoProvider,
-}
-impl rustls::client::danger::ServerCertVerifier for Insecure {
-    fn verify_server_cert(
-        &self,
-        _: &rustls::pki_types::CertificateDer<'_>,
-        _: &[rustls::pki_types::CertificateDer<'_>],
-        _: &rustls::pki_types::ServerName<'_>,
-        _: &[u8],
-        _: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        signature: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            signature,
-            &self.provider.signature_verification_algorithms,
-        )
-    }
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        signature: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            signature,
-            &self.provider.signature_verification_algorithms,
-        )
-    }
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.provider
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
-}
-
 fn validate_extra(config: &Outbound) -> Result<(), Error> {
-    if !matches!(config.transport.as_str(), "" | "tcp" | "raw")
-        || !config.cipher.is_empty()
+    if !config.cipher.is_empty()
         || !config.plugin.is_empty()
         || config.plugin_options != crate::panel::ConfigValue::Null
-        || !config.fingerprint.is_empty()
-        || !config.host.is_empty()
-        || !config.path.is_empty()
-        || !config.service_name.is_empty()
-        || !config.xhttp_mode.is_empty()
-        || !config.xhttp_extra.is_empty()
         || !config.flow.is_empty()
         || !config.multiplex.is_empty()
         || config.uot
@@ -616,11 +493,7 @@ fn validate_extra(config: &Outbound) -> Result<(), Error> {
         || config.udp_stream
         || config.reduce_rtt
         || config.heartbeat != 0
-        || !config.reality_public_key.is_empty()
-        || !config.reality_short_id.is_empty()
-        || !config.spider_x.is_empty()
         || !config.settings.is_empty()
-        || !config.stream_settings.is_empty()
         || !config.extensions.is_empty()
     {
         return Err(Error::Unsupported);

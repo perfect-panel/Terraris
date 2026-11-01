@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Node assembly for the implemented VLESS/TCP driver. No Go runtime is
+//! Node assembly over registered protocol and transport providers. No Go runtime is
 //! launched or embedded; Go/Xray are optional interoperability test tools only.
 use crate::{
     buffer::{BufferPool, PoolConfig},
-    panel::{self, Connection, ProtocolName, ppanel::PPanelConnection},
+    panel::{self, Connection, ppanel::PPanelConnection},
     protocol::{flow, vless},
     resource::{Budget, Limits},
     supervisor::{self, Supervisor},
@@ -14,7 +14,6 @@ use crate::{
 };
 use serde::Deserialize;
 use std::{
-    collections::BTreeSet,
     net::{IpAddr, Ipv4Addr},
     sync::Arc,
     time::Duration,
@@ -146,7 +145,7 @@ impl std::fmt::Display for Error {
 }
 impl std::error::Error for Error {}
 pub struct Node {
-    supervisor: Arc<Supervisor<vless::Factory>>,
+    supervisor: Arc<Supervisor<crate::protocol::Registry>>,
     pool: BufferPool,
     budget: Budget,
     metrics: Metrics,
@@ -166,6 +165,32 @@ impl Node {
         dns: crate::dns::Settings,
         routing: crate::route::Settings,
     ) -> Result<Self, Error> {
+        let protocol_options = settings.protocol_options()?;
+        let policy_options = flow::Options {
+            max_entries: settings.max_users,
+            device_timeout: options.timeout.min(Duration::from_secs(10)),
+        };
+        Self::with_registry(options, settings, move |connection, metrics| {
+            crate::protocol::Registry::builtin(
+                connection,
+                protocol_options,
+                policy_options,
+                dns,
+                routing,
+                metrics,
+            )
+        })
+    }
+    /// Assemble custom providers without changing Node or Supervisor. The closure
+    /// receives the same panel connection used by control-plane users/reports.
+    pub fn with_registry(
+        options: panel::ppanel::Options,
+        settings: Settings,
+        build: impl FnOnce(
+            Arc<dyn Connection>,
+            Metrics,
+        ) -> Result<crate::protocol::Registry, crate::runtime::Error>,
+    ) -> Result<Self, Error> {
         settings.validate()?;
         let fingerprints = options.fingerprints.clone();
         let timeout = options.timeout;
@@ -184,20 +209,7 @@ impl Node {
             .scope(budget.root_scope(), 128 << 10)
             .map_err(|_| Error::Settings)?;
         let metrics = Metrics::default();
-        let factory = Arc::new(
-            vless::Factory::with_network(
-                connection.clone(),
-                settings.protocol_options()?,
-                flow::Options {
-                    max_entries: settings.max_users,
-                    device_timeout: timeout.min(Duration::from_secs(10)),
-                },
-                dns,
-                routing,
-                metrics.clone(),
-            )
-            .map_err(Error::Runtime)?,
-        );
+        let factory = Arc::new(build(connection.clone(), metrics.clone()).map_err(Error::Runtime)?);
         let supervisor = Arc::new(
             Supervisor::new(
                 connection,
@@ -216,9 +228,6 @@ impl Node {
                     operation_timeout: timeout,
                     drain_timeout: Duration::from_secs(settings.drain_timeout_seconds),
                     close_timeout: Duration::from_secs(settings.shutdown_timeout_seconds),
-                    required_protocols: BTreeSet::from([
-                        ProtocolName::new("vless").expect("fixed protocol")
-                    ]),
                     ..Default::default()
                 },
                 metrics.clone(),

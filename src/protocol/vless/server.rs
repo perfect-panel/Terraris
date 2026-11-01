@@ -28,17 +28,12 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
-use tokio::{
-    io::{AsyncRead, AsyncWrite},
-    net::TcpStream,
-    sync::Semaphore,
-};
+use tokio::sync::Semaphore;
 
-pub(super) trait Io: AsyncRead + AsyncWrite + Send + Unpin {}
-impl<T: AsyncRead + AsyncWrite + Send + Unpin> Io for T {}
-pub(super) type Stream = Box<dyn Io>;
+pub(super) type Stream = crate::network::Stream;
 pub struct Factory {
     connection: Arc<dyn Connection>,
+    transports: Arc<crate::transport::Registry>,
     options: Options,
     ingress: Arc<Registry>,
     policies: Arc<Policies>,
@@ -72,6 +67,25 @@ impl Factory {
         routing: crate::route::Settings,
         metrics: crate::telemetry::Metrics,
     ) -> Result<Self, runtime::Error> {
+        let egresses = crate::egress::Registry::new(dns, routing, options.max_connections)
+            .map_err(|_| runtime::Error::Preparation("egress settings"))?;
+        Self::with_services(
+            connection,
+            options,
+            policy_options,
+            egresses,
+            Arc::new(crate::transport::Registry::builtin()),
+            metrics,
+        )
+    }
+    pub fn with_services(
+        connection: Arc<dyn Connection>,
+        options: Options,
+        policy_options: flow::Options,
+        egresses: Arc<crate::egress::Registry>,
+        transports: Arc<crate::transport::Registry>,
+        metrics: crate::telemetry::Metrics,
+    ) -> Result<Self, runtime::Error> {
         options.validate()?;
         let policies = Arc::new(
             Policies::new(policy_options)
@@ -79,13 +93,13 @@ impl Factory {
         );
         Ok(Self {
             connection,
+            transports,
             ingress: Arc::new(Registry::default()),
             policies,
             connections: Arc::new(Semaphore::new(options.max_connections)),
             handshakes: Arc::new(Semaphore::new(options.max_handshakes)),
             associations: super::associations::Registry::new(options.clone()),
-            egresses: crate::egress::Registry::new(dns, routing, options.max_connections)
-                .map_err(|_| runtime::Error::Preparation("egress settings"))?,
+            egresses,
             metrics,
             options,
             encryption_cache: Mutex::new(BTreeMap::new()),
@@ -120,7 +134,7 @@ impl RuntimeFactory for Factory {
     }
 
     fn supports(&self, protocol: &ProtocolName) -> bool {
-        protocol.as_str() == "vless"
+        protocol.as_str() == super::NAME
     }
     async fn prepare_shared(
         &self,
@@ -132,6 +146,8 @@ impl RuntimeFactory for Factory {
         buffers
             .child(self.options.connection_buffers)
             .map_err(|_| runtime::Error::Preparation("connection buffer limits"))?;
+        let mut config = (*config).clone();
+        config.protocols.retain(|p| self.supports(&p.protocol));
         self.egresses
             .open(&config, buffers, self.metrics.clone(), context)
             .await
@@ -145,7 +161,16 @@ impl RuntimeFactory for Factory {
         context: &OperationContext,
     ) -> Result<Arc<dyn ProtocolDriver>, runtime::Error> {
         context.check().map_err(runtime::Error::Stopped)?;
-        let encrypted = if let Some(config) = options::validate(&config, &self.options)? {
+        core.buffers()
+            .child(self.options.connection_buffers)
+            .map_err(|_| runtime::Error::Preparation("connection buffer limits"))?;
+        let transport = self
+            .transports
+            .inbound(&config)
+            .map_err(|_| runtime::Error::Preparation("inbound transport"))?;
+        let encrypted = if let Some(config) =
+            options::validate(&config, &self.options, transport.is_encrypted())?
+        {
             let key = config.cache_key();
             let mut cache = self
                 .encryption_cache
@@ -170,7 +195,7 @@ impl RuntimeFactory for Factory {
         };
         let client = self
             .connection
-            .protocol("vless")
+            .protocol(config.protocol.as_str())
             .map_err(|_| runtime::Error::Preparation("VLESS panel scope"))?;
         let driver = Arc::new_cyclic(|weak| Driver {
             weak: weak.clone(),
@@ -178,6 +203,7 @@ impl RuntimeFactory for Factory {
             egress,
             options: self.options.clone(),
             address: SocketAddr::new(self.options.listen, config.port),
+            transport,
             encryption: Mutex::new(encrypted),
             client,
             policies: self.policies.clone(),
@@ -204,6 +230,7 @@ pub(super) struct Driver {
     pub(super) egress: Arc<Egress>,
     pub(super) options: Options,
     address: SocketAddr,
+    transport: Arc<dyn crate::transport::Inbound>,
     encryption: Mutex<Option<Arc<encryption::Server>>>,
     pub(super) client: Arc<dyn ProtocolClient>,
     pub(super) policies: Arc<Policies>,
@@ -237,7 +264,7 @@ impl Driver {
             .get(uuid)
             .cloned()
     }
-    pub(super) fn accept(self: &Arc<Self>, socket: TcpStream, source: SocketAddr) {
+    pub(super) fn accept(self: &Arc<Self>, socket: Stream, source: SocketAddr) {
         let Ok(connection) = self.connections.clone().try_acquire_owned() else {
             return;
         };
@@ -254,7 +281,7 @@ impl Driver {
     }
     async fn serve(
         self: Arc<Self>,
-        socket: TcpStream,
+        socket: Stream,
         source: SocketAddr,
         cancel: crate::task::CancellationToken,
         handshake: tokio::sync::OwnedSemaphorePermit,
@@ -279,6 +306,11 @@ impl Driver {
         if self.closed() {
             return Err(TaskFailure::Cancelled);
         }
+        let socket = self
+            .transport
+            .handshake(socket, &buffers, &context)
+            .await
+            .map_err(|_| TaskFailure::Failed("transport handshake"))?;
         let mut stream: Stream = if let Some(encryption) = encryption {
             Box::new(
                 encryption
@@ -287,7 +319,7 @@ impl Driver {
                     .map_err(|_| TaskFailure::Failed("encrypted handshake"))?,
             )
         } else {
-            Box::new(socket)
+            socket
         };
         let request = context
             .run(wire::Request::read(&mut stream))
@@ -448,13 +480,21 @@ impl PreparedListener for Listener {
 }
 #[async_trait]
 impl ProtocolDriver for Driver {
+    fn certificate(&self) -> Option<crate::panel::CertificateFingerprint> {
+        self.transport.certificate()
+    }
     async fn prepare_listener(
         &self,
         context: &OperationContext,
     ) -> Result<Box<dyn PreparedListener>, runtime::Error> {
         let binding = self
             .registry
-            .bind(self.address, self.core.metrics().clone(), context)
+            .bind(
+                self.address,
+                self.transport.clone(),
+                self.core.metrics().clone(),
+                context,
+            )
             .await?;
         binding.register(self.weak.clone())?;
         *self.binding.lock().unwrap_or_else(|e| e.into_inner()) = Some(binding);
@@ -502,5 +542,34 @@ impl ProtocolDriver for Driver {
 impl Drop for Driver {
     fn drop(&mut self) {
         self.abort();
+    }
+}
+
+#[async_trait]
+impl crate::protocol::InboundFactory for Factory {
+    fn abort(&self) {
+        self.associations.abort();
+    }
+    async fn close(&self, context: &OperationContext) -> Result<(), runtime::Error> {
+        self.associations
+            .close(
+                context
+                    .deadline()
+                    .unwrap_or_else(|| Deadline::at(tokio::time::Instant::now())),
+            )
+            .await;
+        Ok(())
+    }
+    fn published(&self, shared: &Egress) {
+        self.associations.retain_policy(shared.migration_scope());
+    }
+    async fn prepare(
+        &self,
+        config: ProtocolConfig,
+        shared: Arc<Egress>,
+        core: Core,
+        context: &OperationContext,
+    ) -> Result<Arc<dyn ProtocolDriver>, runtime::Error> {
+        RuntimeFactory::prepare_protocol(self, config, shared, core, context).await
     }
 }

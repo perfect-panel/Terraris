@@ -2,7 +2,9 @@
 
 //! Protocol engines compose through runtimekit and the shared flow policies.
 //! The first concrete adapter is VLESS with UDP/XUDP and Encryption.
+pub mod registry;
 pub mod runtimekit;
+pub use registry::{InboundFactory, Registry};
 
 pub mod vless;
 

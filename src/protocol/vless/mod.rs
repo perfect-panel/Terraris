@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 //! VLESS wire protocol and its Xray-compatible encryption layer.
+pub const NAME: &str = "vless";
+
 pub mod encryption;
 
 pub mod wire;

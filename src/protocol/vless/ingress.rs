@@ -13,7 +13,7 @@ use std::{
     net::SocketAddr,
     sync::{Arc, Mutex, Weak},
 };
-use tokio::{net::TcpListener, sync::Mutex as AsyncMutex};
+use tokio::sync::Mutex as AsyncMutex;
 #[derive(Default)]
 pub(super) struct Registry {
     bindings: AsyncMutex<BTreeMap<SocketAddr, Weak<Ingress>>>,
@@ -22,6 +22,7 @@ impl Registry {
     pub(super) async fn bind(
         &self,
         address: SocketAddr,
+        transport: Arc<dyn crate::transport::Inbound>,
         metrics: Metrics,
         context: &OperationContext,
     ) -> Result<Arc<Ingress>, Error> {
@@ -32,26 +33,30 @@ impl Registry {
         if let Some(binding) = bindings.get(&address).and_then(Weak::upgrade)
             && !binding.cancel.is_cancelled()
         {
+            if binding.key != transport.binding_key() {
+                return Err(Error::Preparation("incompatible listener transport"));
+            }
             return Ok(binding);
         }
         bindings.retain(|_, v| v.strong_count() > 0);
         if !bindings.contains_key(&address) && bindings.len() >= 64 {
             return Err(Error::Preparation("listener capacity"));
         }
-        let listener = context
-            .run(TcpListener::bind(address))
+        let listener = transport
+            .bind(address, context)
             .await
-            .map_err(Error::Stopped)?
-            .map_err(|_| Error::Preparation("TCP bind"))?;
+            .map_err(|_| Error::Preparation("transport bind"))?;
         let cancel = CancellationToken::new();
         let binding = Arc::new(Ingress {
+            key: transport.binding_key().to_owned(),
             routes: Mutex::new(Vec::new()),
             tasks: AsyncMutex::new(TaskGroup::new(&cancel, 1, metrics).map_err(Error::Task)?),
             cancel,
         });
         let weak = Arc::downgrade(&binding);
         binding.tasks.lock().await.spawn("vless.accept",move|cancel|async move{
-            loop{let accepted=tokio::select!{biased;_=cancel.cancelled()=>break,result=listener.accept()=>result};let(socket,source)=match accepted{Ok(v)=>v,Err(_)=>{tokio::time::sleep(std::time::Duration::from_millis(10)).await;continue;}};
+            let context = OperationContext::new(cancel.clone(), None);
+            loop{let accepted=tokio::select!{biased;_=cancel.cancelled()=>break,result=listener.accept(&context)=>result};let(socket,source)=match accepted{Ok(v)=>v,Err(_)=>{tokio::time::sleep(std::time::Duration::from_millis(10)).await;continue;}};
                 let Some(binding)=weak.upgrade()else{break;};let driver=binding.candidates().into_iter().find(|driver|driver.accepting());drop(binding);
                 if let Some(driver)=driver{driver.accept(socket,source);} // Otherwise the unready socket is dropped.
             }Ok(())
@@ -61,6 +66,7 @@ impl Registry {
     }
 }
 pub(super) struct Ingress {
+    key: String,
     routes: Mutex<Vec<Weak<Driver>>>,
     tasks: AsyncMutex<TaskGroup>,
     cancel: CancellationToken,

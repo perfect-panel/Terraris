@@ -637,3 +637,283 @@ async fn registry_shutdown_cancels_a_retained_packet_port() {
     drop(handle);
     assert_eq!(budget.snapshot().used().bytes(), 0);
 }
+
+struct RegisteredOutbound {
+    address: SocketAddr,
+    compiled: Arc<AtomicUsize>,
+    connected: Arc<AtomicUsize>,
+}
+impl terraris::outbound::registry::Factory for RegisteredOutbound {
+    fn kind(&self) -> terraris::outbound::registry::Kind {
+        terraris::outbound::registry::Kind::Proxy
+    }
+    fn compile(
+        &self,
+        config: &terraris::panel::Outbound,
+        _: &terraris::outbound::registry::Context,
+    ) -> Result<Option<Arc<dyn terraris::outbound::Connector>>, terraris::outbound::Error> {
+        assert_eq!(config.protocol.as_str(), "registered");
+        self.compiled.fetch_add(1, Ordering::SeqCst);
+        Ok(Some(Arc::new(RegisteredConnector {
+            address: self.address,
+            connected: self.connected.clone(),
+        })))
+    }
+}
+struct RegisteredConnector {
+    address: SocketAddr,
+    connected: Arc<AtomicUsize>,
+}
+#[async_trait::async_trait]
+impl terraris::outbound::Connector for RegisteredConnector {
+    fn supports(&self, network: Network) -> bool {
+        network == Network::Tcp
+    }
+    async fn connect(
+        &self,
+        target: &Address,
+        _: &BufferScope,
+        context: &OperationContext,
+    ) -> Result<terraris::network::Stream, terraris::outbound::Error> {
+        assert_eq!(target.to_string(), "unresolved.test:443");
+        self.connected.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(
+            context
+                .run(tokio::net::TcpStream::connect(self.address))
+                .await
+                .map_err(terraris::outbound::Error::Stopped)??,
+        ))
+    }
+    async fn packet(
+        &self,
+        _: BufferScope,
+        _: &OperationContext,
+    ) -> Result<Arc<dyn terraris::outbound::PacketPort>, terraris::outbound::Error> {
+        panic!("UDP must be rejected before opening the connector")
+    }
+}
+#[tokio::test]
+async fn registered_outbound_alias_drives_routing_and_network_capability_without_builtin_dispatch()
+{
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (mut io, _) = listener.accept().await.unwrap();
+        io.write_all(b"custom").await.unwrap();
+    });
+    let compiled = Arc::new(AtomicUsize::new(0));
+    let connected = Arc::new(AtomicUsize::new(0));
+    let mut outbounds = terraris::outbound::Registry::builtin_builder();
+    outbounds
+        .register(
+            "registered",
+            &["custom-alias"],
+            Arc::new(RegisteredOutbound {
+                address,
+                compiled: compiled.clone(),
+                connected: connected.clone(),
+            }),
+        )
+        .unwrap();
+    let config = config(
+        json!({"protocols":[{"type":"custom-inbound","enable":true,"port":12345}],
+        "outbound":[{"name":"custom-proxy","protocol":"custom-alias","rules":["domain:test"]}]}),
+    )
+    .await;
+    let registry = Registry::with_providers(
+        dns::Settings::default(),
+        terraris::route::Settings::default(),
+        16,
+        Arc::new(outbounds.build()),
+        Arc::new(terraris::transport::Registry::builtin()),
+    )
+    .unwrap();
+    let (budget, scope) = resources();
+    let handle = registry
+        .open(&config, scope.clone(), Metrics::default(), &ctx())
+        .await
+        .unwrap();
+    let target = Address::from_domain("unresolved.test", 443).unwrap();
+    let plan = handle.plan(&target, Network::Tcp, &ctx()).await.unwrap();
+    assert_eq!(plan.decision.target, Target::Proxy(0));
+    assert!(matches!(
+        handle.plan(&target, Network::Udp, &ctx()).await,
+        Err(Error::Outbound(terraris::outbound::Error::Unsupported))
+    ));
+    let mut stream = handle.connect(&target, &ctx(), scope).await.unwrap();
+    let mut bytes = [0; 6];
+    ctx()
+        .run(stream.read_exact(&mut bytes))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&bytes, b"custom");
+    assert_eq!(compiled.load(Ordering::SeqCst), 1);
+    assert_eq!(connected.load(Ordering::SeqCst), 1);
+    drop(stream);
+    handle.close(&ctx()).await.unwrap();
+    registry.close(&ctx()).await.unwrap();
+    task.await.unwrap();
+    assert_eq!(budget.snapshot().used().bytes(), 0);
+}
+struct PrefaceTransport;
+impl terraris::transport::Factory for PrefaceTransport {
+    fn inbound(
+        &self,
+        _: &terraris::panel::ProtocolConfig,
+    ) -> Result<Arc<dyn terraris::transport::Inbound>, terraris::transport::Error> {
+        Err(terraris::transport::Error::Unsupported)
+    }
+    fn outbound(
+        &self,
+        _: &terraris::panel::Outbound,
+        _: Arc<rustls::ClientConfig>,
+    ) -> Result<Arc<dyn terraris::transport::Outbound>, terraris::transport::Error> {
+        Ok(Arc::new(PrefaceTransport))
+    }
+}
+#[async_trait::async_trait]
+impl terraris::transport::Outbound for PrefaceTransport {
+    async fn connect(
+        &self,
+        addresses: &[SocketAddr],
+        _: &BufferScope,
+        context: &OperationContext,
+    ) -> Result<(terraris::network::Stream, SocketAddr), terraris::transport::Error> {
+        let mut stream = context
+            .run(tokio::net::TcpStream::connect(addresses))
+            .await
+            .map_err(terraris::transport::Error::Stopped)??;
+        let peer = stream.peer_addr()?;
+        context
+            .run(stream.write_all(b"marker\n"))
+            .await
+            .map_err(terraris::transport::Error::Stopped)??;
+        Ok((Box::new(stream), peer))
+    }
+}
+#[tokio::test]
+async fn builtin_http_proxy_uses_registered_outbound_transport() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (mut io, _) = listener.accept().await.unwrap();
+        let mut preface = [0; 7];
+        io.read_exact(&mut preface).await.unwrap();
+        assert_eq!(&preface, b"marker\n");
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            request.push(io.read_u8().await.unwrap());
+        }
+        assert!(request.starts_with(b"CONNECT unresolved.test:443 HTTP/1.1\r\n"));
+        io.write_all(b"HTTP/1.1 200 OK\r\n\r\ntransport")
+            .await
+            .unwrap();
+    });
+    let mut transports = terraris::transport::Registry::builtin_builder();
+    transports
+        .register("preface", &["marked"], Arc::new(PrefaceTransport))
+        .unwrap();
+    let config = config(json!({"outbound":[{"name":"proxy","protocol":"http","address":"127.0.0.1","port":address.port(),"transport":"marked","rules":["domain:test"]}]})).await;
+    let registry = Registry::with_providers(
+        dns::Settings::default(),
+        terraris::route::Settings::default(),
+        16,
+        Arc::new(terraris::outbound::Registry::builtin()),
+        Arc::new(transports.build()),
+    )
+    .unwrap();
+    let (_, scope) = resources();
+    let handle = registry
+        .open(&config, scope.clone(), Metrics::default(), &ctx())
+        .await
+        .unwrap();
+    let mut stream = handle
+        .connect(
+            &Address::from_domain("unresolved.test", 443).unwrap(),
+            &ctx(),
+            scope,
+        )
+        .await
+        .unwrap();
+    let mut bytes = [0; 9];
+    ctx()
+        .run(stream.read_exact(&mut bytes))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&bytes, b"transport");
+    drop(stream);
+    handle.close(&ctx()).await.unwrap();
+    registry.close(&ctx()).await.unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn transport_rejects_unknown_tls_and_unused_options_without_fallback() {
+    for extra in [
+        json!({"transport":"ws"}),
+        json!({"security":"reality"}),
+        json!({"sni":"unused.test"}),
+        json!({"allow_insecure":true}),
+        json!({"host":"unused.test"}),
+        json!({"path":"/unused"}),
+        json!({"security":"tls","sni":"invalid/name"}),
+        json!({"security":"tls","alpn":["h2"]}), // HTTP supports HTTP/1.1 only
+    ] {
+        let mut proxy = json!({"name":"proxy","protocol":"http","address":"127.0.0.1","port":12345,"rules":["domain:test"]});
+        for (key, value) in extra.as_object().unwrap() {
+            proxy[key] = value.clone();
+        }
+        let config = config(json!({"outbound":[proxy]})).await;
+        let registry = Registry::new(
+            dns::Settings::default(),
+            terraris::route::Settings::default(),
+            16,
+        )
+        .unwrap();
+        let (_, scope) = resources();
+        assert!(
+            registry
+                .open(&config, scope, Metrics::default(), &ctx())
+                .await
+                .is_err()
+        );
+        registry.close(&ctx()).await.unwrap();
+    }
+}
+#[tokio::test]
+async fn tls_transport_cancellation_drops_unfinished_handshake_socket() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let config = config(json!({"outbound":[{"name":"proxy","protocol":"http","address":"127.0.0.1","port":address.port(),"security":"tls"}]})).await;
+    let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(rustls::RootCertStore::empty())
+    .with_no_client_auth();
+    let transport = terraris::transport::Registry::builtin()
+        .outbound(&config.outbounds[0], Arc::new(tls))
+        .unwrap();
+    let (_, scope) = resources();
+    let cancel = CancellationToken::new();
+    let operation = OperationContext::new(cancel.clone(), None);
+    let addresses = [address];
+    let connect = transport.connect(&addresses, &scope, &operation);
+    tokio::pin!(connect);
+    let mut peer = tokio::select! {
+        result = &mut connect => panic!("unexpected result: {:?}", result.err()),
+        accepted = listener.accept() => accepted.unwrap().0,
+    };
+    cancel.cancel();
+    assert!(matches!(
+        connect.await,
+        Err(terraris::transport::Error::Stopped(
+            terraris::time::StopReason::Cancelled
+        ))
+    ));
+    let result = ctx().run(peer.read_to_end(&mut Vec::new())).await.unwrap();
+    assert!(result.is_ok() || result.unwrap_err().kind() == std::io::ErrorKind::ConnectionReset);
+}
