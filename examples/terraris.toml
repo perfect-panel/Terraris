@@ -1,0 +1,11 @@
+[panel]
+# Includes any reverse-proxy API prefix; HTTPS is recommended for deployment.
+base_url = "https://panel.example.com"
+server_id = 1
+secret_env = "TERRARIS_PANEL_SECRET"
+# Alternatively, remove secret_env and set secret_file (relative to this file).
+# secret_file = "panel.secret"
+wire_format = "auto" # auto, json, protobuf
+timeout_seconds = 30
+max_response_bytes = 67108864
+max_request_bytes = 8388608

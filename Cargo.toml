@@ -1,0 +1,40 @@
+[package]
+name = "terraris"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "PPanel node foundation with a Polaris-inspired control plane"
+license = "GPL-3.0-only"
+publish = false
+
+[dependencies]
+async-trait = "0.1"
+clap = { version = "4.5", features = ["derive"] }
+prost = "0.14.4"
+prost-types = "0.14.4"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "http2"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "net", "io-util", "sync"] }
+toml = "1.1"
+url = "2"
+
+[build-dependencies]
+prost-build = "0.14.4"
+protoc-bin-vendored = "3.3"
+
+[dev-dependencies]
+axum = "0.8"
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+dbg_macro = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

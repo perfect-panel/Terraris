@@ -1,0 +1,4 @@
+/target/
+/terraris.toml
+*.log
+.DS_Store
