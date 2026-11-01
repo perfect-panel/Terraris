@@ -107,6 +107,9 @@ impl MockPanel {
             Secret::new(SECRET),
         )
     }
+    pub fn push(&self, reply: Reply) {
+        self.state.replies.lock().unwrap().push_back(reply);
+    }
     pub fn requests(&self) -> Vec<Recorded> {
         self.state.requests.lock().unwrap().clone()
     }

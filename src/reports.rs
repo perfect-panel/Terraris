@@ -31,6 +31,20 @@ impl std::error::Error for Error {}
 struct Counts {
     upload: u64,
     download: u64,
+    reserved_upload: u64,
+    reserved_download: u64,
+    reservations: usize,
+    active: usize,
+}
+impl Counts {
+    fn removable(&self) -> bool {
+        self.upload == 0
+            && self.download == 0
+            && self.reserved_upload == 0
+            && self.reserved_download == 0
+            && self.active == 0
+            && self.reservations == 0
+    }
 }
 struct Online {
     active: usize,
@@ -108,18 +122,34 @@ impl Reports {
             return Err(Error::Full);
         }
         let old = s.traffic.get(&traffic.id).copied().unwrap_or_default();
+        old.upload
+            .checked_add(old.reserved_upload)
+            .and_then(|v| v.checked_add(traffic.upload))
+            .ok_or(Error::Overflow)?;
+        old.download
+            .checked_add(old.reserved_download)
+            .and_then(|v| v.checked_add(traffic.download))
+            .ok_or(Error::Overflow)?;
         let next = Counts {
-            upload: old
-                .upload
-                .checked_add(traffic.upload)
-                .ok_or(Error::Overflow)?,
-            download: old
-                .download
-                .checked_add(traffic.download)
-                .ok_or(Error::Overflow)?,
+            upload: old.upload + traffic.upload,
+            download: old.download + traffic.download,
+            ..old
         };
         s.traffic.insert(traffic.id, next);
         Ok(())
+    }
+    /// Reserve a counter slot before forwarding any authenticated payload.
+    pub fn traffic_lease(&self, id: SubscriptionId) -> Result<TrafficLease, Error> {
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.traffic.contains_key(&id) && state.traffic.len() >= self.inner.limit {
+            return Err(Error::Full);
+        }
+        let entry = state.traffic.entry(id).or_default();
+        entry.active = entry.active.checked_add(1).ok_or(Error::Overflow)?;
+        Ok(TrafficLease {
+            reports: self.clone(),
+            id,
+        })
     }
     pub fn traffic_batch(
         &self,
@@ -251,7 +281,7 @@ impl TrafficBatch {
                 .expect("reserved traffic entry");
             current.upload -= delta.upload;
             current.download -= delta.download;
-            if current.upload == 0 && current.download == 0 {
+            if current.removable() {
                 s.traffic.remove(&delta.id);
             }
             s.traffic_cursor = Some(delta.id);
@@ -339,5 +369,103 @@ impl Drop for OnlineBatch {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .online_inflight = false;
+    }
+}
+
+/// Keeps the user's counter entry alive across empty ACKs and concurrent writes.
+pub struct TrafficLease {
+    reports: Reports,
+    id: SubscriptionId,
+}
+impl TrafficLease {
+    pub fn reserve(&self, upload: bool, bytes: u64) -> Result<TrafficReservation, Error> {
+        let mut state = self
+            .reports
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let entry = state.traffic.get_mut(&self.id).expect("leased counter");
+        let count = entry.reservations.checked_add(1).ok_or(Error::Overflow)?;
+        let (current, reserved) = if upload {
+            (entry.upload, &mut entry.reserved_upload)
+        } else {
+            (entry.download, &mut entry.reserved_download)
+        };
+        current
+            .checked_add(*reserved)
+            .and_then(|v| v.checked_add(bytes))
+            .ok_or(Error::Overflow)?;
+        *reserved += bytes;
+        entry.reservations = count;
+        Ok(TrafficReservation {
+            reports: self.reports.clone(),
+            id: self.id,
+            upload,
+            remaining: bytes,
+        })
+    }
+}
+impl Drop for TrafficLease {
+    fn drop(&mut self) {
+        let mut state = self
+            .reports
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let entry = state.traffic.get_mut(&self.id).expect("leased counter");
+        entry.active -= 1;
+        if entry.removable() {
+            state.traffic.remove(&self.id);
+        }
+    }
+}
+/// Counter headroom is reserved before I/O; only the successful prefix is
+/// committed, so accounting cannot fail after the socket accepted bytes.
+pub struct TrafficReservation {
+    reports: Reports,
+    id: SubscriptionId,
+    upload: bool,
+    remaining: u64,
+}
+impl TrafficReservation {
+    pub fn commit(&mut self, bytes: u64) {
+        assert!(bytes <= self.remaining);
+        let mut state = self
+            .reports
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let entry = state.traffic.get_mut(&self.id).expect("reserved counter");
+        if self.upload {
+            entry.reserved_upload -= bytes;
+            entry.upload += bytes;
+        } else {
+            entry.reserved_download -= bytes;
+            entry.download += bytes;
+        }
+        self.remaining -= bytes;
+    }
+}
+impl Drop for TrafficReservation {
+    fn drop(&mut self) {
+        let mut state = self
+            .reports
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let entry = state.traffic.get_mut(&self.id).expect("reserved counter");
+        entry.reservations -= 1;
+        if self.upload {
+            entry.reserved_upload -= self.remaining;
+        } else {
+            entry.reserved_download -= self.remaining;
+        }
+        if entry.removable() {
+            state.traffic.remove(&self.id);
+        }
     }
 }

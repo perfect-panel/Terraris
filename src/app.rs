@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! CLI composition. No proxy listener or fictitious online heartbeat is started.
+//! CLI composition. Read-only checks and explicitly requested VLESS node run.
 
 use std::{fmt, path::PathBuf};
 
@@ -18,7 +18,7 @@ use crate::{
 #[command(
     name = "terraris",
     version,
-    about = "PPanel control-plane foundation; proxy runtimes are not yet implemented"
+    about = "PPanel Rust node with VLESS, XUDP and VLESS Encryption"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -27,6 +27,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Run the VLESS node, synchronizing panel policy and serving configured ports.
+    Run {
+        #[arg(short, long, default_value = "terraris.toml")]
+        config: PathBuf,
+    },
     /// Validate local settings; --panel also reads remote configuration, users and alive counts.
     Check {
         #[arg(short, long, default_value = "terraris.toml")]
@@ -45,6 +50,7 @@ pub enum Error {
     Config(config::Error),
     Panel(panel::Error),
     Interrupted,
+    Node(crate::node::Error),
 }
 
 impl fmt::Display for Error {
@@ -53,6 +59,7 @@ impl fmt::Display for Error {
             Self::Config(e) => e.fmt(f),
             Self::Panel(e) => e.fmt(f),
             Self::Interrupted => f.write_str("check interrupted"),
+            Self::Node(e) => e.fmt(f),
         }
     }
 }
@@ -99,6 +106,7 @@ pub async fn check_panel(options: Options) -> panel::Result<PanelSummary> {
 
 pub async fn run() -> Result<(), Error> {
     match Cli::parse().command {
+        Command::Run { config: path } => run_node(path).await?,
         Command::Version => println!("terraris {}", env!("CARGO_PKG_VERSION")),
         Command::Capabilities => {
             println!(
@@ -110,9 +118,10 @@ pub async fn run() -> Result<(), Error> {
             println!(
                 "infrastructure: tracked tasks, monotonic deadlines, budgeted TCP/UDP I/O, bounded codecs, metrics"
             );
-            println!("proxy protocols: none (foundation stage)");
+            println!("proxy protocols: vless (TCP, UDP, XUDP; mlkem768x25519plus)");
+            println!("transports: TCP; encryption native/xorpub/random, 1-RTT/0-RTT");
             println!(
-                "runtime: library scheduler, transactional users, controller/supervisor and runtimekit; no proxy driver or run command"
+                "runtime: scheduler, transactional users, device admission, shared user rate limits, accounting and generation handoff"
             );
         }
         Command::Check {
@@ -141,4 +150,47 @@ pub async fn run() -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+async fn run_node(path: PathBuf) -> Result<(), Error> {
+    let config = config::Config::load(&path).map_err(Error::Config)?;
+    let options = config.connection_options(&path).map_err(Error::Config)?;
+    let node = crate::node::Node::new(options, config.node).map_err(Error::Node)?;
+    let cancellation = crate::task::CancellationToken::new();
+    let context = crate::time::OperationContext::new(cancellation.clone(), None);
+    let run = async {
+        node.start(&crate::node::Node::startup_context(&context).map_err(Error::Node)?)
+            .await
+            .map_err(Error::Node)?;
+        let snapshot = node.snapshot();
+        println!(
+            "Node configuration applied: {} active protocol(s), ready={}",
+            snapshot.protocols.len(),
+            snapshot.ready
+        );
+        node.run(&context).await.map_err(Error::Node)
+    };
+    tokio::pin!(run);
+    tokio::select! {
+        result=&mut run=>result,
+        _=shutdown_signal()=>{
+            cancellation.cancel();
+            let result=run.await;
+            let cleanup=crate::time::OperationContext::new(crate::task::CancellationToken::new(),Some(crate::time::Deadline::after(std::time::Duration::from_secs(120)).expect("fixed timeout")));
+            node.close(&cleanup).await.map_err(Error::Node)?;
+            match result{Err(Error::Node(crate::node::Error::Supervisor(crate::supervisor::Error::Stopped(_))))=>Ok(()),result=>result}
+        }
+    }
+}
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        if let Ok(mut terminate) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            tokio::select! {_=tokio::signal::ctrl_c()=>{},_=terminate.recv()=>{}}
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
 }

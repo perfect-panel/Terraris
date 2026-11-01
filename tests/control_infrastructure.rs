@@ -477,3 +477,55 @@ async fn revocation_interrupts_inflight_operation_and_propagates_to_children() {
     assert_eq!(pending.await.unwrap(), Err(StopReason::Cancelled));
     assert_eq!(context.check(), Err(StopReason::Cancelled));
 }
+
+#[test]
+fn counter_reservations_keep_slots_across_ack_and_refund_cancelled_writes() {
+    let reports = Reports::new(1).unwrap();
+    let lease = reports.traffic_lease(id(1)).unwrap();
+    let mut write = lease.reserve(true, 100).unwrap();
+    write.commit(30);
+    let batch = reports.traffic_batch(0, 1).unwrap().unwrap();
+    assert_eq!(batch.values()[0].upload, 30);
+    drop(lease);
+    batch.acknowledge();
+    assert!(matches!(
+        reports.traffic_lease(id(2)),
+        Err(reports::Error::Full)
+    ));
+    drop(write);
+    assert_eq!(reports.snapshot().traffic_users, 0);
+    let lease = reports.traffic_lease(id(1)).unwrap();
+    let empty = lease.reserve(false, 0).unwrap();
+    drop(lease);
+    drop(empty);
+    assert_eq!(reports.snapshot().traffic_users, 0);
+}
+#[test]
+fn reserved_counter_headroom_cannot_be_consumed_by_concurrent_direct_recording() {
+    let reports = Reports::new(1).unwrap();
+    let lease = reports.traffic_lease(id(1)).unwrap();
+    let mut reserved = lease.reserve(true, u64::MAX).unwrap();
+    assert!(matches!(
+        reports.record_traffic(Traffic {
+            id: id(1),
+            upload: 1,
+            download: 0
+        }),
+        Err(reports::Error::Overflow)
+    ));
+    assert!(matches!(
+        lease.reserve(true, 1),
+        Err(reports::Error::Overflow)
+    ));
+    reserved.commit(5);
+    drop(reserved);
+    assert_eq!(reports.snapshot().pending_bytes, 5);
+    reports
+        .record_traffic(Traffic {
+            id: id(1),
+            upload: 2,
+            download: 0,
+        })
+        .unwrap();
+    assert_eq!(reports.snapshot().pending_bytes, 7);
+}

@@ -18,6 +18,8 @@ use crate::panel::{Secret, ServerId, WireMode, ppanel::Options};
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub panel: PanelConfig,
+    #[serde(default)]
+    pub node: crate::node::Settings,
 }
 
 #[derive(Deserialize)]
@@ -85,6 +87,9 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), Error> {
+        self.node
+            .validate()
+            .map_err(|_| Error("invalid node limits or timeouts"))?;
         let p = &self.panel;
         if p.secret_env.is_some() == p.secret_file.is_some() {
             return Err(Error(

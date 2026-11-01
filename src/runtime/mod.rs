@@ -116,8 +116,10 @@ pub trait SharedServices: Send + Sync + 'static {
 
 #[async_trait]
 /// Preparation futures must own and release partial resources on cancellation.
-/// Drivers must keep all spawned work in Core and check Core admission for every
-/// connection, UDP association and multiplexed substream before proxy traffic.
+/// Connection work belongs to Core. Shared ingress/resolver work must retain
+/// bounded owning task groups and join them in its explicit close lifecycle.
+/// Check Core admission for every connection, UDP association and multiplexed
+/// substream before proxy traffic.
 pub trait RuntimeFactory: Send + Sync + 'static {
     type Shared: SharedServices;
     fn supports(&self, protocol: &ProtocolName) -> bool;

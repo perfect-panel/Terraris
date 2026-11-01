@@ -1079,3 +1079,201 @@ async fn aborting_run_stops_admission_and_later_close_can_join_remaining_tasks()
     assert!(runtime.core().is_closed());
     h.supervisor.close(&ctx()).await.unwrap();
 }
+
+#[tokio::test(start_paused = true)]
+async fn flow_limits_are_shared_by_upload_download_and_survive_generation_switch() {
+    use crate::protocol::flow::{Options as PolicyOptions, Policies};
+    let h = Harness::new(&["trojan"]);
+    let mut limited = user(1, "first");
+    limited.speed_limit_mbps = 1;
+    h.panel.users(vec![limited]);
+    h.sync().await;
+    let policies = Policies::new(PolicyOptions::default()).unwrap();
+    let core = h.runtime("trojan").core();
+    let id = core.users().view().snapshot.authenticate("first").unwrap();
+    let client: Arc<dyn ProtocolClient> = Arc::new(Client {
+        panel: h.panel.clone(),
+        name: name("trojan"),
+    });
+    let first = policies
+        .admit(&core, &id, "127.0.0.1".parse().unwrap(), client.clone())
+        .await
+        .unwrap();
+    h.panel.config(config(&["trojan"], 2));
+    h.sync().await;
+    let next = h.runtime("trojan").core();
+    let second = policies
+        .admit(&next, &id, "127.0.0.2".parse().unwrap(), client)
+        .await
+        .unwrap();
+    let started = tokio::time::Instant::now();
+    let upload = async {
+        let mut permit = first.quota(62500).await.unwrap();
+        permit.commit(62500);
+    };
+    let download = async {
+        let mut permit = second.quota(62500).await.unwrap();
+        permit.commit(62500);
+    };
+    tokio::join!(upload, download);
+    assert_eq!(started.elapsed(), Duration::from_secs(1));
+    let permit = first.quota(8192).await.unwrap();
+    drop(permit);
+    let started = tokio::time::Instant::now();
+    let mut refunded = second.quota(8192).await.unwrap();
+    refunded.commit(8192);
+    assert_eq!(started.elapsed(), Duration::ZERO);
+}
+struct DeviceClient {
+    calls: AtomicUsize,
+    response: Mutex<panel::Result<DeviceClaim>>,
+    block: Mutex<Option<Arc<Block>>>,
+    name: ProtocolName,
+}
+#[async_trait]
+impl ProtocolClient for DeviceClient {
+    fn protocol(&self) -> &ProtocolName {
+        &self.name
+    }
+    fn policy(&self) -> ProtocolPolicy {
+        ProtocolPolicy {
+            devices: DevicePolicy::AtomicPanelLease,
+            report_active_and_unconfirmed: true,
+            max_online_entries: 10000,
+        }
+    }
+    async fn claim_device(
+        &self,
+        _: SubscriptionId,
+        _: std::net::IpAddr,
+    ) -> panel::Result<DeviceClaim> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let block = self.block.lock().unwrap().take();
+        if let Some(block) = block {
+            block.entered.notify_one();
+            block.release.notified().await;
+        }
+        self.response.lock().unwrap().clone()
+    }
+    async fn get_users(&self, _: Option<&Validator>) -> panel::Result<Fetch<Vec<User>>> {
+        panic!("unexpected device client users")
+    }
+    async fn get_alive(&self) -> panel::Result<BTreeMap<SubscriptionId, u64>> {
+        panic!("unexpected device client alive")
+    }
+    async fn report_online(&self, _: &[OnlineUser]) -> panel::Result<()> {
+        panic!("unexpected device client online")
+    }
+    async fn report_traffic(&self, _: &[Traffic]) -> panel::Result<()> {
+        panic!("unexpected device client traffic")
+    }
+}
+#[tokio::test(start_paused = true)]
+async fn device_claims_coalesce_canonical_ips_across_protocol_scopes() {
+    use crate::protocol::flow::{Options as PolicyOptions, Policies};
+    let h = Harness::new(&["alpha", "beta"]);
+    let mut limited = user(1, "first");
+    limited.device_limit = 1;
+    h.panel.users(vec![limited]);
+    h.sync().await;
+    let policies = Arc::new(Policies::new(PolicyOptions::default()).unwrap());
+    let block = Arc::new(Block::default());
+    let client = Arc::new(DeviceClient {
+        calls: AtomicUsize::new(0),
+        response: Mutex::new(Ok(DeviceClaim {
+            allowed: true,
+            ttl: Duration::from_secs(60),
+        })),
+        block: Mutex::new(Some(block.clone())),
+        name: name("alpha"),
+    });
+    let owned = policies.clone();
+    let port = client.clone();
+    let core = h.runtime("alpha").core();
+    let id = core.users().view().snapshot.authenticate("first").unwrap();
+    let first = tokio::spawn(async move {
+        owned
+            .admit(&core, &id, "127.0.0.1".parse().unwrap(), port)
+            .await
+    });
+    block.entered.notified().await;
+    let owned = policies.clone();
+    let port = client.clone();
+    let core = h.runtime("beta").core();
+    let id = core.users().view().snapshot.authenticate("first").unwrap();
+    let second = tokio::spawn(async move {
+        owned
+            .admit(&core, &id, "::ffff:127.0.0.1".parse().unwrap(), port)
+            .await
+    });
+    tokio::task::yield_now().await;
+    block.release.notify_one();
+    let first = first.await.unwrap().unwrap();
+    let second = second.await.unwrap().unwrap();
+    assert_eq!(client.calls.load(Ordering::SeqCst), 1);
+    assert!(first.check().is_ok());
+    assert!(second.check().is_ok());
+}
+#[tokio::test(start_paused = true)]
+async fn failed_device_renewal_stops_pending_io_at_the_confirmed_ttl() {
+    use crate::protocol::flow::{Error as PolicyError, Options as PolicyOptions, Policies};
+    let h = Harness::new(&["trojan"]);
+    let mut limited = user(1, "first");
+    limited.device_limit = 1;
+    h.panel.users(vec![limited]);
+    h.sync().await;
+    let policies = Policies::new(PolicyOptions::default()).unwrap();
+    let client = Arc::new(DeviceClient {
+        calls: AtomicUsize::new(0),
+        response: Mutex::new(Ok(DeviceClaim {
+            allowed: true,
+            ttl: Duration::from_secs(3),
+        })),
+        block: Mutex::new(None),
+        name: name("trojan"),
+    });
+    let core = h.runtime("trojan").core();
+    let id = core.users().view().snapshot.authenticate("first").unwrap();
+    let session = policies
+        .admit(&core, &id, "127.0.0.1".parse().unwrap(), client.clone())
+        .await
+        .unwrap();
+    *client.response.lock().unwrap() = Err(panel::Error::http(Endpoint::Device, 503));
+    let started = tokio::time::Instant::now();
+    let maintenance = session.maintain();
+    let blocked = session.run(std::future::pending::<()>());
+    tokio::pin!(maintenance, blocked);
+    tokio::select! {result=&mut blocked=>assert!(matches!(result,Err(PolicyError::DeviceExpired))),result=&mut maintenance=>assert!(result.is_err())};
+    assert_eq!(started.elapsed(), Duration::from_secs(3));
+    assert!(session.check().is_err());
+}
+#[tokio::test(start_paused = true)]
+async fn denied_device_never_registers_online_or_leaves_counter_slots() {
+    use crate::protocol::flow::{Options as PolicyOptions, Policies};
+    let h = Harness::new(&["trojan"]);
+    let mut limited = user(1, "first");
+    limited.device_limit = 1;
+    h.panel.users(vec![limited]);
+    h.sync().await;
+    let core = h.runtime("trojan").core();
+    let id = core.users().view().snapshot.authenticate("first").unwrap();
+    let policies = Policies::new(PolicyOptions::default()).unwrap();
+    let client = Arc::new(DeviceClient {
+        calls: AtomicUsize::new(0),
+        response: Mutex::new(Ok(DeviceClaim {
+            allowed: false,
+            ttl: Duration::from_secs(60),
+        })),
+        block: Mutex::new(None),
+        name: name("trojan"),
+    });
+    assert!(
+        policies
+            .admit(&core, &id, "127.0.0.1".parse().unwrap(), client)
+            .await
+            .is_err()
+    );
+    assert_eq!(core.active_sessions(), 0);
+    assert_eq!(core.reports().snapshot().traffic_users, 0);
+    assert_eq!(core.reports().snapshot().online_ips, 0);
+}

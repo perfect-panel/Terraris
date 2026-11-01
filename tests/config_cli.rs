@@ -76,14 +76,16 @@ fn endpoint_options_reject_credentialed_ambiguous_or_non_http_urls() {
 }
 
 #[test]
-fn cli_capabilities_and_version_do_not_claim_proxy_support() {
+fn cli_capabilities_and_version_describe_implemented_vless_scope() {
     let output = Command::new(env!("CARGO_BIN_EXE_terraris"))
         .arg("capabilities")
         .output()
         .unwrap();
     assert!(output.status.success());
     let body = String::from_utf8(output.stdout).unwrap();
-    assert!(body.contains("proxy protocols: none"));
+    assert!(body.contains("proxy protocols: vless"));
+    assert!(body.contains("XUDP"));
+    assert!(body.contains("mlkem768x25519plus"));
     assert!(body.contains("ppanel"));
     let output = Command::new(env!("CARGO_BIN_EXE_terraris"))
         .arg("version")
@@ -105,4 +107,31 @@ fn schema_copy_matches_recorded_digest() {
         Sha256::digest(include_bytes!("../proto/ppanel/server.proto"))
     );
     assert!(include_str!("../proto/ppanel/README.md").contains(&digest));
+}
+
+#[test]
+fn node_settings_enforce_resource_and_timeout_relationships() {
+    for node in [
+        "max_connections=0",
+        "max_connections=4\nmax_handshakes=5",
+        "memory_bytes=1024",
+        "connection_buffer_slots=0",
+        "max_xudp_sessions=0",
+        "user_max_age_seconds=0",
+        "queue_packets=1025",
+        "listen='not-an-ip'",
+        "unknown='sensitive-node-value'",
+    ] {
+        let error = Config::parse(&format!("{}\n[node]\n{node}\n", config("secret_env='KEY'")))
+            .err()
+            .expect("reject invalid node config");
+        assert!(!format!("{error:?}").contains("sensitive-node-value"));
+    }
+    let value = Config::parse(&format!(
+        "{}\n[node]\nlisten='127.0.0.1'\n",
+        config("secret_env='KEY'")
+    ))
+    .unwrap();
+    assert!(!value.node.allow_plaintext);
+    assert_eq!(value.node.max_handshakes, 128);
 }

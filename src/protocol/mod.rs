@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Product adapters compose their protocol engines through runtimekit. No proxy
-//! wire implementation is registered by this control-plane foundation.
+//! Protocol engines compose through runtimekit and the shared flow policies.
+//! The first concrete adapter is VLESS with UDP/XUDP and Encryption.
 pub mod runtimekit;
+
+pub mod vless;
+
+pub mod flow;

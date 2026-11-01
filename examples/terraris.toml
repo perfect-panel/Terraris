@@ -9,3 +9,23 @@ wire_format = "auto" # auto, json, protobuf
 timeout_seconds = 30
 max_response_bytes = 67108864
 max_request_bytes = 8388608
+
+[node]
+# Protocol ports, users and Encryption settings are supplied by PPanel.
+listen = "0.0.0.0"
+# Without Encryption, use a trusted loopback transport or explicitly opt in.
+allow_plaintext = false
+memory_bytes = 67108864
+buffer_slots = 16384
+connection_memory_bytes = 4194304
+connection_buffer_slots = 256
+max_connections = 4096
+max_handshakes = 128
+max_xudp_sessions = 32
+queue_packets = 32
+user_max_age_seconds = 900
+handshake_timeout_seconds = 10
+idle_timeout_seconds = 300
+udp_idle_timeout_seconds = 60
+drain_timeout_seconds = 30
+shutdown_timeout_seconds = 5

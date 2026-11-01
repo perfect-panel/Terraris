@@ -2,13 +2,14 @@
 
 Terraris 是参考 Polaris 架构设计的 PPanel Rust 节点端项目，负责代理协议接入、用户认证、限速与设备准入，以及节点状态、在线设备和流量上报。
 
-当前已完成 Rust 基础工程、PPanel 面板客户端、B1–B3 基础设施，以及 B4 的 scheduler、用户事务更新、runtimekit 和 Controller/Supervisor。代理协议、限速/设备执行器及持久化上报尚未实现；二进制仍用于配置与只读检查，控制面通过 library API 装配真实驱动后使用。
+当前已完成 B1–B4 基础设施与控制面，以及 B5 的 VLESS TCP、UDP/XUDP 和 VLESS Encryption 接入。`terraris run` 可运行实际 Rust 节点，包含用户撤销、共享限速、设备租约与计量。已通过本机 Xray 互通；持久化上报、其他传输/协议及生产部署验证仍待完成。
 
 - [架构设计](docs/architecture.md)：模块边界、状态管理、协议规划、故障处理与实施阶段。
 - [PPanel 接口契约](docs/ppanel-api.md)：当前 backend 的实际接口、身份与计量语义、兼容性要求。
 - [基础设施顺序](docs/infrastructure.md)：先完成资源、任务、buffer 和基础 I/O，再接控制面运行时。
 - [Buffer 系统设计](docs/buffer.md)：所有权、前后预留空间、共享切片、内存预算、池化和背压。
 - [B4 控制面与运行时](docs/control-plane.md)：事务提交、准入、代次切换、维护调度、报告与退出。
+- [B5 VLESS 接入](docs/vless.md)：当前协议组合、Encryption 参数、运行方式和 Xray 互通复现。
 
 设计沿用 Polaris 的 `panel → supervisor/controller → protocol` 分层，以 `runtimekit` 统一运行时生命周期、以 `flow` 统一数据面策略。采用单进程、多协议结构，优先面向 Linux x86_64 和 aarch64。Rust 负责节点控制与协议集成；候选协议库必须能接入统一的用户策略、连接管理和流量计量。
 
@@ -31,7 +32,10 @@ Terraris 是参考 Polaris 架构设计的 PPanel Rust 节点端项目，负责�
 - Controller/Supervisor 提供配置与用户同步、候选回滚、跨代次共享状态、退役清理、可选主机状态采样与指纹发布。
 - Reports 提供有上限的内存流量/在线状态、批次确认和最终冲刷；进程重启不保留，面板 ACK 丢失仍有重复计费风险。
 
-设备租约、用户限制和流量接口目前由 library 暴露；这不代表已经有数据面执行这些策略。
+- VLESS 实际驱动支持 UUID 多用户、TCP/UDP/XUDP、三种 VLESS Encryption 外观和 1-RTT/0-RTT；使用统一的限速、设备和计量策略。
+- 同端口候选共享 accept loop，失败更新保留活跃服务；相同加密设置的重载保留恢复票据。
+
+当前载体为 TCP；TLS、REALITY、Vision 等非默认组合会拒绝。XUDP 会话不通过 GlobalID 跨承载连接迁移。完整能力边界见 [VLESS 文档](docs/vless.md)。
 
 ## Resource 和 Buffer 使用约定
 
@@ -91,7 +95,7 @@ FrameDecoder 的 consumed 指明本次消费量，剩余输入由调用方保留
 
 候选认证和监听器全部提交成功前，准入始终关闭。共享用户快照、报告和配置验证器在同一发布事务中切换；失败保留活跃代次，旧响应通过 revision/代次检查拒绝。旧会话继续看到当前限制和撤销。默认用户快照 15 分钟未确认后暂停，401/403 立即暂停。
 
-协议驱动必须为每个连接或子流取得 `Core::admit` 许可，并将其 context 用于后续 I/O；所有异步任务交给 Core。关闭依次停止接入、限时排空、取消和 join，退役重试不延长原截止时间。当前只用测试驱动验证这些约定，没有生产协议或监听器实现。完整上限、接入契约与边界见 [B4 文档](docs/control-plane.md)。
+协议驱动必须为每个连接或子流取得 `Core::admit` 许可，并将其 context 用于后续 I/O；连接任务交给 Core；共享 ingress 保留独立的有界任务组，并在最后一个路由释放时关闭和等待。关闭依次停止接入、限时排空、取消和 join，退役重试不延长原截止时间。B5 已通过 VLESS 驱动接入这些约定，并以真实回环 socket 和 Xray 客户端验证。完整上限、接入契约与边界见 [B4 文档](docs/control-plane.md) 和 [VLESS 文档](docs/vless.md)。
 
 ## 构建与本地检查
 
@@ -104,6 +108,16 @@ cargo run --locked -- check --config examples/terraris.toml
 ```
 
 本地 `check` 校验 TOML、URL、ID、超时和大小限制，不读取密钥来源，也不访问面板。
+
+## 运行 VLESS 节点
+
+配置面板凭据和 `[node]` 资源限制，在 PPanel 下发 VLESS/Encryption 参数后执行：
+
+```sh
+./target/release/terraris run --config terraris.toml
+```
+
+`run` 会绑定面板端口、同步用户、执行设备准入并上报在线/流量；SIGINT/SIGTERM 执行排空、任务回收和最终冲刷。默认外部监听要求启用 VLESS Encryption；loopback 可用于受信任的外部承载。详细配置与可复现互通命令见 [B5 文档](docs/vless.md)。
 
 ## 面板联通检查
 
@@ -145,7 +159,7 @@ cargo build --locked --release
 
 资源和 buffer 测试覆盖作用域聚合、混合批次与缓存淘汰、共享/Bytes 生命周期、关闭和取消竞态、零长度名额、溢出、封包边界，以及分配失败和 unwind 回滚。队列使用可控时间验证 FIFO、超时和授予/取消交错；Rustdoc 验证 BufferLease、QueuePermit 无法 Clone，SharedBuffer 不可写。
 
-B3 测试包含可控时钟下的任务关停/超时、短写和失败前缀计数、真实 IPv4 回环 TCP 半关闭与 UDP 包边界、超限夹具、分段 codec 输入及指标并发。B4 增加多协议提交回滚、旧响应/用户更新竞争、跨代次会话、调度、报告 ACK 和关闭测试。性能和生产部署仍需后续验证。
+B3 测试包含可控时钟下的任务关停/超时、短写和失败前缀计数、真实 IPv4 回环 TCP 半关闭与 UDP 包边界、超限夹具、分段 codec 输入及指标并发。B4 增加多协议提交回滚、旧响应/用户更新竞争、跨代次会话、调度、报告 ACK 和关闭测试。B5 增加协议边界、设备 TTL、共享限速、实际 TCP/UDP/XUDP、同端口重载和 CLI 退出测试；另有固定版本 Xray 外部测试。性能和生产部署仍需后续验证。
 
 [CI 配置](.github/workflows/ci.yml) 在 Linux 和 macOS 上执行格式、Clippy、测试及 release 构建。当前本地验证不等于生产面板、Redis/PostgreSQL 或 Linux 部署联调。
 
@@ -153,4 +167,4 @@ B3 测试包含可控时钟下的任务关停/超时、短写和失败前缀计�
 
 ## 许可证
 
-Terraris 使用 GNU General Public License v3.0（SPDX：`GPL-3.0-only`），完整条款见 [LICENSE](LICENSE)。第三方文件保留各自的来源与许可证声明。
+Terraris 使用 GNU General Public License v3.0（SPDX：`GPL-3.0-only`），完整条款见 [LICENSE](LICENSE)。第三方文件保留各自的来源与许可证声明，详见 [THIRD_PARTY.md](THIRD_PARTY.md)。

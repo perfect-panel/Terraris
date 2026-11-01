@@ -609,7 +609,7 @@ impl<F: RuntimeFactory> Supervisor<F> {
             }
             selected.push(protocol.clone());
         }
-        if !config.protocols.is_empty()
+        if config.protocols.iter().any(|protocol| protocol.enabled)
             && self
                 .options
                 .required_protocols
@@ -800,11 +800,18 @@ impl<F: RuntimeFactory> Supervisor<F> {
             self.options.config_interval.saturating_mul(8),
         )
         .map_err(Error::Scheduler)?;
+        let config_schedule = if self.snapshot().generation.is_some() {
+            schedule
+                .initial_delay(self.options.config_interval)
+                .map_err(Error::Scheduler)?
+        } else {
+            schedule
+        };
         let owned = self.clone();
         let config = JobSpec::new(
             "config",
             Lane::Critical,
-            schedule,
+            config_schedule,
             scheduler::job(move |ctx| {
                 let owned = owned.clone();
                 async move {

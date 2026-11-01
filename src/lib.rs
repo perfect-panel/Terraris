@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Terraris infrastructure and control-plane foundation.
+//! Terraris node, runtime infrastructure, and PPanel integration.
 
 pub mod app;
 pub mod buffer;
@@ -9,6 +9,7 @@ pub mod config;
 pub mod controller;
 pub mod dataplane;
 pub mod network;
+pub mod node;
 pub mod panel;
 pub mod protocol;
 pub mod reports;

@@ -1,6 +1,6 @@
 # Terraris 架构设计
 
-状态：架构基线。日期：2026-11-01。Rust 基础工程、PPanel 接口及 B1–B4 基础设施和控制面 library 已实现，当前能力见 [README](../README.md) 与 [B4 文档](control-plane.md)。更新生命周期已用模拟驱动验证；真实协议、flow、限速、设备执行器和生产运维仍在后续阶段。
+状态：架构基线。日期：2026-11-01。B1–B4 基础设施与控制面，以及 B5 VLESS/TCP、UDP/XUDP、VLESS Encryption、flow 策略和 run CLI 已实现。当前能力见 [README](../README.md) 与 [VLESS 文档](vless.md)；生产运维和其他协议仍在后续阶段。
 
 Terraris 以 Polaris 的实际模块和生命周期为架构基线：`panel` 隔离面板协议，`supervisor` 管服务器配置代次，`controller` 管单协议用户与维护任务，`protocol::runtimekit` 统一运行时装配，`protocol::flow` 统一数据面策略。通过 Rust 的所有权、类型和异步任务模型实现这些边界。
 
@@ -8,7 +8,7 @@ Terraris 以 Polaris 的实际模块和生命周期为架构基线：`panel` 隔
 
 ## 1 目标与实施范围
 
-首个可用版本需要贯通配置拉取、用户更新、TCP/UDP 转发、限速、全局设备名额、在线心跳和流量上报。仅能同步面板的进程属于控制面原型，不宣称是可用代理节点。
+首个可用版本以 VLESS 贯通配置拉取、用户更新、TCP/UDP 转发、限速、全局设备名额、在线心跳和流量上报。仅能同步面板的进程属于控制面原型，不宣称是可用代理节点。
 
 生产目标为 Linux x86_64、aarch64；macOS 用于开发。采用 Rust 应用及协议库，不嵌入或启动 Xray、sing-box、Polaris 等 Go 内核。成熟密码库、SQLite 的 C 或汇编依赖可以使用；“Rust 节点”不承诺整个依赖树没有其他语言。
 
@@ -49,7 +49,7 @@ TCP 字节流和 UDP 数据报分别建模。QUIC 流可以交付字节流接口
 
 初期使用一个 Cargo package，包含二进制入口和可测试的内部模块，模块命名与 Polaris 对齐。现成 Rust 协议引擎以依赖引入；需要自研且可独立复用的引擎再单独拆 crate。crate 数量不决定架构分层，跨模块依赖规则从第一版生效。
 
-以下是目标模块划分；当前已实现 `app`、`config`、`panel` 及 B1–B4 基础设施和控制面。真实协议、flow、限速与设备执行器在 B5 引入；runtime factory 当前没有生产协议实现：
+以下是目标模块划分；当前已实现 `app`、`config`、`panel` 及 B1–B4 基础设施和控制面。B5 已引入 VLESS、flow、限速和设备执行器；其余目标模块按后续阶段实施：
 
 | 拟定 Rust 模块 | 职责 | Polaris 对应位置 |
 | --- | --- | --- |
@@ -287,12 +287,12 @@ DNS 和出站使用结构化能力声明。像 Polaris 的共享 Egress 一样�
 
 | 阶段 | 拟定能力 | 发布门槛 |
 | --- | --- | --- |
-| 首个协议原型 | Shadowsocks 2022 AES-128/AES-256 EIH，多用户、TCP 与 UDP | PPanel 订阅凭据互通；用户可热增删；会话可撤销；每用户计量正确 |
-| 第一轮扩展 | Trojan over TCP+TLS；评估传统 Shadowsocks AEAD 多用户 | 复用同一准入和流处理层；传统 AEAD 需单独验证同端口多密钥选择及滥用成本 |
-| 第二轮扩展 | VLESS 基础传输、TUIC v5、Hysteria2 | 各自独立互通矩阵；QUIC 需验证拥塞控制、UDP 和认证时序 |
-| 单独立项 | REALITY、Vision、VLESS Encryption、XHTTP、AnyTLS、VMess 及其他协议 | 明确协议版本、实现来源、客户端互通与维护成本后排期 |
+| 首个协议原型 | VLESS TCP、UDP/XUDP、VLESS Encryption | B5 已完成本地 Xray 互通、用户热更新、撤销与计量验证；能力边界见 VLESS 文档 |
+| 第一轮扩展 | Shadowsocks 2022 EIH、Trojan over TCP+TLS；评估传统 Shadowsocks AEAD 多用户 | 复用同一准入和流处理层；传统 AEAD 需单独验证同端口多密钥选择及滥用成本 |
+| 第二轮扩展 | VLESS 其他传输、TUIC v5、Hysteria2 | 各自独立互通矩阵；QUIC 需验证拥塞控制、UDP 和认证时序 |
+| 单独立项 | REALITY、Vision、XHTTP、AnyTLS、VMess 及其他协议 | 明确协议版本、实现来源、客户端互通与维护成本后排期 |
 
-SS2022 库的 `set_user_manager` 提供 EIH 多用户入口，但这不足以证明能满足 Terraris 的在线替换、用户身份回传和会话撤销需求。第一个原型必须证明这些接口能接入；如不满足，就记录所需适配或库修改，不能用单密码服务器冒充多用户支持。
+SS2022 延后到后续扩展。其 `set_user_manager` 提供 EIH 多用户入口，但仍须单独验证在线替换、身份回传和撤销能否接入统一策略，不能用单密码服务器冒充多用户支持。
 
 同样，“使用 Quinn”只提供 QUIC 传输能力，不自动获得 TUIC/Hysteria2 认证、HTTP/3、混淆、拥塞行为或线协议兼容性。每种协议用明确的功能组合声明能力，例如密码套件、TCP/UDP、传输、安全层、插件、mux 和 UoT，而非一个笼统的“支持”开关。
 
@@ -304,11 +304,11 @@ SS2022 库的 `set_user_manager` 提供 EIH 多用户入口，但这不足以证
 
 密钥通过权限受控的文件或环境变量注入，避免命令行参数泄漏。HTTP 客户端在错误中只输出端点路径、状态和请求标识；不打印完整带 query 的 URL、UUID、证书私钥或面板响应体。显式配置面板 API 前缀，路径拼接不能丢失前缀。
 
-check、capabilities 和 version 已实现；run 随服务运行时阶段加入：
+check、capabilities、version 和 VLESS run 已实现：
 
 | 命令 | 行为 |
 | --- | --- |
-| `terraris run --config …` | 待实现：启动同步与入站 |
+| `terraris run --config …` | 已实现：同步配置/用户并运行 VLESS；不支持的协议组合会拒绝 |
 | `terraris check --config …` | 本地配置检查，无网络请求 |
 | `terraris check --config … --panel` | 只读拉取并校验面板配置及用户；不申请设备、不上报、不监听 |
 | `terraris capabilities` | 显示本构建支持的协议与功能组合 |
@@ -346,8 +346,8 @@ check、capabilities 和 version 已实现；run 随服务运行时阶段加入�
 | M0 架构设计 | Polaris 架构映射与 PPanel 接口契约 | 已完成模块、端口和状态所有权设计 |
 | M1a 基础工程与面板接口 | Rust 工程、PanelConnection、完整 PPanel 客户端、只读检查 CLI | 已通过本地 JSON/Protobuf 契约测试及 Go 编码样本互操作；真实部署联调待完成 |
 | M1b 基础设施与 Buffer | resource、buffer、task/time、network/codec、基础 dataplane 与指标 | B1–B3 已完成，已验证预算、回收、双向复制、数据报和 codec；性能及生产部署仍待验证 |
-| M1c 控制面与协议可行性 | scheduler、users、Supervisor/Controller、RuntimeKit、模拟运行时和 SS2022 适配原型 | B4 控制面已完成模拟验证；B5 的 SS2022 多用户、真实监听器及热更新适配仍待实现 |
-| M2 首个代理闭环 | SS2022 TCP/UDP、用户快照、流处理、限速与设备准入 | 真实兼容客户端互通；用户撤销取消在途拨号；跨节点竞争同一设备名额不超限 |
+| M1c 控制面与协议可行性 | scheduler、users、Supervisor/Controller、RuntimeKit、模拟运行时和 VLESS 适配 | B4 模拟验证及 B5 VLESS 实际驱动、共享监听器和热更新已完成本地验证 |
+| M2 首个代理闭环 | VLESS TCP/UDP/XUDP、Encryption、用户快照、flow、限速与设备准入 | Xray 本地互通和策略测试已通过；真实面板及跨节点设备竞争仍需验证 |
 | M3 生产运行基础 | 持久化上报、更新恢复、退出与服务包装 | 响应丢失、重启恢复、存储失败、证书替换、长期离线、负载与资源限额测试 |
 | M4 协议扩展 | 按能力矩阵逐项增加协议 | 每个协议沿用 M2/M3 的策略与故障测试，增加独立互通用例 |
 
