@@ -80,6 +80,9 @@ pub(super) fn validate(
     if config.port == 0 {
         return Err(Error::Unsupported);
     }
+    if config.uot_version > 2 || (!config.uot && config.uot_version != 0) {
+        return Err(Error::Unsupported);
+    }
     reject_extra(config)?;
     let encryption = encryption::Config::from_panel(config)
         .map_err(|_| Error::Preparation("VLESS encryption settings"))?;
@@ -103,8 +106,6 @@ fn reject_extra(config: &ProtocolConfig) -> Result<(), Error> {
         || !config.plugin.is_empty()
         || config.plugin_options != crate::panel::ConfigValue::Null
         || !config.flow.is_empty()
-        || config.uot
-        || config.uot_version != 0
         || !config.hop_ports.is_empty()
         || config.hop_interval != 0
         || !config.obfs_password.expose().is_empty()

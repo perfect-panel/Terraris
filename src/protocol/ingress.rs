@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! One accept loop per address, shared across configuration candidates. Preparing
 //! a candidate never redirects an established listener away from the live driver.
-use super::server::Driver;
 use crate::{
     runtime::Error,
     task::{CancellationToken, TaskGroup},
@@ -14,12 +13,18 @@ use std::{
     sync::{Arc, Mutex, Weak},
 };
 use tokio::sync::Mutex as AsyncMutex;
+
+pub(crate) trait Acceptor: Send + Sync {
+    fn closed(&self) -> bool;
+    fn accepting(&self) -> bool;
+    fn accept(self: Arc<Self>, stream: crate::network::Stream, source: SocketAddr);
+}
 #[derive(Default)]
-pub(super) struct Registry {
+pub(crate) struct Registry {
     bindings: AsyncMutex<BTreeMap<SocketAddr, Weak<Ingress>>>,
 }
 impl Registry {
-    pub(super) async fn bind(
+    pub(crate) async fn bind(
         &self,
         address: SocketAddr,
         transport: Arc<dyn crate::transport::Inbound>,
@@ -54,7 +59,7 @@ impl Registry {
             cancel,
         });
         let weak = Arc::downgrade(&binding);
-        binding.tasks.lock().await.spawn("vless.accept",move|cancel|async move{
+        binding.tasks.lock().await.spawn("protocol.accept",move|cancel|async move{
             let context = OperationContext::new(cancel.clone(), None);
             loop{let accepted=tokio::select!{biased;_=cancel.cancelled()=>break,result=listener.accept(&context)=>result};let(socket,source)=match accepted{Ok(v)=>v,Err(_)=>{tokio::time::sleep(std::time::Duration::from_millis(10)).await;continue;}};
                 let Some(binding)=weak.upgrade()else{break;};let driver=binding.candidates().into_iter().find(|driver|driver.accepting());drop(binding);
@@ -65,14 +70,14 @@ impl Registry {
         Ok(binding)
     }
 }
-pub(super) struct Ingress {
+pub(crate) struct Ingress {
     key: String,
-    routes: Mutex<Vec<Weak<Driver>>>,
+    routes: Mutex<Vec<Weak<dyn Acceptor>>>,
     tasks: AsyncMutex<TaskGroup>,
     cancel: CancellationToken,
 }
 impl Ingress {
-    pub(super) fn register(&self, driver: Weak<Driver>) -> Result<(), Error> {
+    pub(crate) fn register(&self, driver: Weak<dyn Acceptor>) -> Result<(), Error> {
         let mut routes = self.routes.lock().unwrap_or_else(|e| e.into_inner());
         if self.cancel.is_cancelled() {
             return Err(Error::Closed);
@@ -86,7 +91,7 @@ impl Ingress {
         routes.push(driver);
         Ok(())
     }
-    fn candidates(&self) -> Vec<Arc<Driver>> {
+    fn candidates(&self) -> Vec<Arc<dyn Acceptor>> {
         self.routes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -94,10 +99,10 @@ impl Ingress {
             .filter_map(Weak::upgrade)
             .collect()
     }
-    pub(super) fn stop_if_unused(&self) {
+    pub(crate) fn stop_if_unused(&self) {
         // Declare strong owners first so even unwinding releases routes before
         // their destructors. Registration and the final stop decision serialize.
-        let drivers: Vec<Arc<Driver>>;
+        let drivers: Vec<Arc<dyn Acceptor>>;
         let routes = self.routes.lock().unwrap_or_else(|e| e.into_inner());
         drivers = routes.iter().filter_map(Weak::upgrade).collect();
         if drivers.iter().all(|driver| driver.closed()) {
@@ -106,7 +111,7 @@ impl Ingress {
         drop(routes);
         drop(drivers);
     }
-    pub(super) async fn close_if_unused(&self, deadline: Deadline) {
+    pub(crate) async fn close_if_unused(&self, deadline: Deadline) {
         self.stop_if_unused();
         if self.cancel.is_cancelled() {
             self.tasks.lock().await.shutdown(deadline).await;

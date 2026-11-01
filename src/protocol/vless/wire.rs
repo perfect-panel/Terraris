@@ -135,11 +135,13 @@ pub async fn read_address<R: AsyncRead + Unpin + ?Sized>(reader: &mut R) -> Resu
             let length = reader.read_u8().await? as usize;
             let mut host = [0; 255];
             reader.read_exact(&mut host[..length]).await?;
-            Address::from_domain(
-                std::str::from_utf8(&host[..length]).map_err(|_| Error::Address)?,
-                port,
-            )
-            .map_err(|_| Error::Address)
+            let name = std::str::from_utf8(&host[..length]).map_err(|_| Error::Address)?;
+            let port = if crate::protocol::uot::Version::for_domain(name).is_some() {
+                port.max(1)
+            } else {
+                port
+            };
+            Address::from_domain(name, port).map_err(|_| Error::Address)
         }
         _ => Err(Error::Address),
     }

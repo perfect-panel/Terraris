@@ -9,7 +9,6 @@ pub mod wire;
 pub mod xudp;
 
 mod egress;
-mod ingress;
 mod options;
 mod server;
 mod udp;

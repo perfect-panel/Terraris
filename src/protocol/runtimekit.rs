@@ -281,6 +281,9 @@ impl Runtime {
     pub fn certificate(&self) -> Option<CertificateFingerprint> {
         self.driver.certificate()
     }
+    pub fn reload_required(&self) -> Result<bool, Error> {
+        self.driver.reload_required()
+    }
     pub(crate) async fn prepare_control(&self, context: &OperationContext) -> Result<(), Error> {
         if self.core().is_closed()
             || self.core().gate().is_open()

@@ -2,7 +2,7 @@
 
 Terraris 是参考 Polaris 架构设计的 PPanel Rust 节点端项目，负责代理协议接入、用户认证、限速与设备准入，以及节点状态、在线设备和流量上报。
 
-当前已完成 B1–B4 基础设施与控制面、B5 的 VLESS TCP、UDP/XUDP 和 VLESS Encryption 接入，以及共享路由、DNS 和 SOCKS5/HTTP/VLESS 出站。`terraris run` 可运行实际 Rust 节点，包含用户撤销、共享限速、设备租约与计量。已通过本机 Xray 互通；持久化上报、其他传输/协议及生产部署验证仍待完成。
+当前已完成 B1–B4 基础设施与控制面、B5 的 VLESS TCP、UDP/XUDP 和 VLESS Encryption 接入，以及 Trojan、AnyTLS、TLS 入站、UoT、共享路由、DNS 和 SOCKS5/HTTP/VLESS 出站。`terraris run` 可运行实际 Rust 节点，包含用户撤销、共享限速、设备租约与计量。已通过本机 Xray 和官方 AnyTLS 客户端互通；持久化上报、其他传输/协议及生产部署验证仍待完成。
 
 - [架构设计](docs/architecture.md)：模块边界、状态管理、协议规划、故障处理与实施阶段。
 - [PPanel 接口契约](docs/ppanel-api.md)：当前 backend 的实际接口、身份与计量语义、兼容性要求。
@@ -10,6 +10,7 @@ Terraris 是参考 Polaris 架构设计的 PPanel Rust 节点端项目，负责�
 - [Buffer 系统设计](docs/buffer.md)：所有权、前后预留空间、共享切片、内存预算、池化和背压。
 - [B4 控制面与运行时](docs/control-plane.md)：事务提交、准入、代次切换、维护调度、报告与退出。
 - [B5 VLESS 接入](docs/vless.md)：当前协议组合、Encryption 参数、运行方式和 Xray 互通复现。
+- [TLS、Trojan、AnyTLS 与 UoT](docs/tls-protocols.md)：本地 PEM、证书热重载、多流、UDP 和客户端互通。
 - [协议与传输注册表](docs/registries.md)：工厂扩展、别名、内置实现与热重载生命周期。
 - [路由、DNS 与代理出站](docs/routing-dns.md)：规则语义、GeoData、解析缓存、DoH/DoT、重载与验证。
 
@@ -36,9 +37,10 @@ Terraris 是参考 Polaris 架构设计的 PPanel Rust 节点端项目，负责�
 
 - protocol/outbound/transport 提供不可变工厂注册表；启动时注册和验证别名，Node 经注册表装配，支持自定义协议与流载体。
 - VLESS 实际驱动支持 UUID 多用户、TCP/UDP/XUDP、三种 VLESS Encryption 外观和 1-RTT/0-RTT；使用统一的限速、设备和计量策略。
+- Trojan 支持 TLS/TCP 和 UDP；AnyTLS 支持 v1/v2 多流会话及 UoT。TLS 使用 rustls/aws-lc-rs，支持本地 PEM 校验、指纹上报和事务热重载。
 - 同端口候选共享 accept loop，失败更新保留活跃服务；相同加密设置的重载保留恢复票据。
 
-当前入站载体为 TCP；入站 TLS、REALITY、Vision 等非默认组合会拒绝。代理出站支持标准 TLS。非零 GlobalID 现可跨承载连接及兼容配置代次迁移，保留 UDP 出口 socket；恢复仍需用户和设备准入。完整能力边界见 [VLESS 文档](docs/vless.md)。
+当前入站载体为 TCP/raw，可组合标准 TLS；REALITY、Vision 等组合会拒绝。代理出站支持标准 TLS 和可选 UoT。非零 GlobalID 现可跨承载连接及兼容配置代次迁移，保留 UDP 出口 socket；恢复仍需用户和设备准入。完整能力边界见 [VLESS 文档](docs/vless.md)。
 
 ## DNS、限速和路由现状
 
@@ -120,15 +122,15 @@ cargo run --locked -- check --config examples/terraris.toml
 
 本地 `check` 校验 TOML、URL、ID、超时和大小限制，不读取密钥来源，也不访问面板。
 
-## 运行 VLESS 节点
+## 运行代理节点
 
-配置面板凭据和 `[node]` 资源限制，在 PPanel 下发 VLESS/Encryption 参数后执行：
+配置面板凭据和 `[node]` 资源限制，在 PPanel 下发协议参数后执行；TLS 证书配置见 [TLS 文档](docs/tls-protocols.md)：
 
 ```sh
 ./target/release/terraris run --config terraris.toml
 ```
 
-`run` 会绑定面板端口、同步用户、执行设备准入并上报在线/流量；SIGINT/SIGTERM 执行排空、任务回收和最终冲刷。默认外部监听要求启用 VLESS Encryption；loopback 可用于受信任的外部承载。详细配置与可复现互通命令见 [B5 文档](docs/vless.md)。
+`run` 会绑定面板端口、同步用户、执行设备准入并上报在线/流量；SIGINT/SIGTERM 执行排空、任务回收和最终冲刷。默认外部 VLESS 监听要求启用 TLS 或 VLESS Encryption；loopback 可用于受信任的外部承载。详细配置与可复现互通命令见 [B5 文档](docs/vless.md)。
 
 ## 面板联通检查
 

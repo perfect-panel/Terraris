@@ -423,7 +423,13 @@ impl<F: RuntimeFactory> Supervisor<F> {
         let refresh = active
             .as_ref()
             .filter(|_| !replaces)
-            .map(|active| active.shared.0.reload_required())
+            .map(|active| {
+                let mut refresh = active.shared.0.reload_required()?;
+                for runtime in active.runtimes.values() {
+                    refresh |= runtime.reload_required()?;
+                }
+                Ok::<_, runtime::Error>(refresh)
+            })
             .transpose()
             .map_err(Error::Runtime)?
             .unwrap_or(false);

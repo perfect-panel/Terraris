@@ -36,6 +36,7 @@ pub struct Proxy {
     uuid: Option<[u8; 16]>,
     transport: Arc<dyn crate::transport::Outbound>,
     encryption: Option<Arc<encryption::Client>>,
+    pub(crate) uot: Option<crate::protocol::uot::Version>,
     system: Arc<System>,
 }
 impl Proxy {
@@ -45,6 +46,17 @@ impl Proxy {
         context: &super::registry::Context,
     ) -> Result<Self, Error> {
         validate_extra(config)?;
+        let uot = if config.uot {
+            Some(
+                crate::protocol::uot::Version::from_config(config.uot_version)
+                    .map_err(|_| Error::Unsupported)?,
+            )
+        } else {
+            if config.uot_version != 0 {
+                return Err(Error::Unsupported);
+            }
+            None
+        };
         if config.address.is_empty() || config.address.len() > 253 || config.port == 0 {
             return Err(Error::Configuration("proxy endpoint"));
         }
@@ -101,6 +113,7 @@ impl Proxy {
             uuid,
             transport,
             encryption,
+            uot,
             system: context.system.clone(),
         })
     }
@@ -231,6 +244,22 @@ impl Proxy {
         scope: BufferScope,
         context: &OperationContext,
     ) -> Result<Arc<dyn PacketPort>, Error> {
+        if let Some(version) = self.uot {
+            let mut stream = self
+                .connect(
+                    &Address::from_domain(version.domain(), 1).map_err(|_| Error::Protocol)?,
+                    &scope,
+                    context,
+                )
+                .await?;
+            let codec = context
+                .run(version.write(&mut stream, None))
+                .await
+                .map_err(Error::Stopped)??;
+            return Ok(Arc::new(super::packet::FramedPacket::new(
+                stream, codec, scope,
+            )));
+        }
         match self.kind {
             Kind::Http => Err(Error::Unsupported),
             Kind::Socks5 => {
@@ -487,8 +516,6 @@ fn validate_extra(config: &Outbound) -> Result<(), Error> {
         || config.plugin_options != crate::panel::ConfigValue::Null
         || !config.flow.is_empty()
         || !config.multiplex.is_empty()
-        || config.uot
-        || config.uot_version != 0
         || !config.congestion_controller.is_empty()
         || config.udp_stream
         || config.reduce_rtt

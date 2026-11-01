@@ -1,6 +1,6 @@
 # Terraris 架构设计
 
-状态：架构基线。日期：2026-11-01。B1–B4 基础设施与控制面，以及 B5 VLESS/TCP、UDP/XUDP、GlobalID 迁移、VLESS Encryption、flow 策略和 run CLI 已实现。当前能力见 [README](../README.md) 与 [VLESS 文档](vless.md)；生产运维和其他协议仍在后续阶段。
+状态：架构基线。日期：2026-11-01。B1–B4 基础设施与控制面，以及 B5 VLESS/TCP、UDP/XUDP、GlobalID 迁移、VLESS Encryption、flow 策略和 run CLI 已实现。当前能力见 [README](../README.md) 与 [VLESS 文档](vless.md)；Trojan、AnyTLS、UoT、rustls/aws-lc-rs TLS 入站及本地 PEM 热重载也已接入；生产运维和剩余协议仍在后续阶段。
 
 Terraris 以 Polaris 的实际模块和生命周期为架构基线：`panel` 隔离面板协议，`supervisor` 管服务器配置代次，`controller` 管单协议用户与维护任务，`protocol::runtimekit` 统一运行时装配，`protocol::flow` 统一数据面策略。通过 Rust 的所有权、类型和异步任务模型实现这些边界。
 
@@ -49,9 +49,9 @@ TCP 字节流和 UDP 数据报分别建模。QUIC 流可以交付字节流接口
 
 初期使用一个 Cargo package，包含二进制入口和可测试的内部模块，模块命名与 Polaris 对齐。现成 Rust 协议引擎以依赖引入；需要自研且可独立复用的引擎再单独拆 crate。crate 数量不决定架构分层，跨模块依赖规则从第一版生效。
 
-`route` / `dns` / `outbound` 已实现独立模块并由公共 `egress` 接入 VLESS TCP/UDP/XUDP：顺序规则、GeoData、分域 DNS、缓存、DoH/DoT，以及直连/阻断/DNS/SOCKS5/HTTP/VLESS 出站。限速按协议/订阅共享。实现语义和当前范围见 [路由与 DNS](routing-dns.md)。
+`route` / `dns` / `outbound` 已实现独立模块并由公共 `egress` 接入 VLESS、Trojan、AnyTLS 的 TCP/UDP/XUDP/UoT：顺序规则、GeoData、分域 DNS、缓存、DoH/DoT，以及直连/阻断/DNS/SOCKS5/HTTP/VLESS 出站。限速按协议/订阅共享。实现语义和当前范围见 [路由与 DNS](routing-dns.md)。
 
-协议、出站和字节流传输已有工厂注册表；Node 使用 `Supervisor<protocol::Registry>`，内置 VLESS、现有出站与 TCP/raw（含出站 TLS）通过注册表装配。新增实现不需要更改 Node、Supervisor 或路由的协议分派；接口与生命周期见 [注册表](registries.md)。
+协议、出站和字节流传输已有工厂注册表；Node 使用 `Supervisor<protocol::Registry>`，内置 VLESS/Trojan/AnyTLS、现有出站与 TCP/raw（含入站和出站 TLS）通过注册表装配。新增实现不需要更改 Node、Supervisor 或路由的协议分派；接口与生命周期见 [注册表](registries.md)。
 
 以下是目标模块划分；当前已实现 `app`、`config`、`panel` 及 B1–B4 基础设施和控制面。B5 已引入 VLESS、flow、限速和设备执行器；其余目标模块按后续阶段实施：
 
@@ -294,15 +294,15 @@ DNS 和出站使用结构化能力声明。像 Polaris 的共享 Egress 一样�
 | 阶段 | 拟定能力 | 发布门槛 |
 | --- | --- | --- |
 | 首个协议原型 | VLESS TCP、UDP/XUDP、VLESS Encryption | B5 已完成本地 Xray 互通、用户热更新、撤销与计量验证；能力边界见 VLESS 文档 |
-| 第一轮扩展 | Shadowsocks 2022 EIH、Trojan over TCP+TLS；评估传统 Shadowsocks AEAD 多用户 | 复用同一准入和流处理层；传统 AEAD 需单独验证同端口多密钥选择及滥用成本 |
+| 已完成协议扩展 | Trojan TCP/UDP、AnyTLS v1/v2、UoT、TLS 入站与本地 PEM 热重载 | 复用同一准入和流处理层；已验证 Xray Trojan 与官方 AnyTLS 客户端互通 |
 | 第二轮扩展 | VLESS 其他传输、TUIC v5、Hysteria2 | 各自独立互通矩阵；QUIC 需验证拥塞控制、UDP 和认证时序 |
-| 单独立项 | REALITY、Vision、XHTTP、AnyTLS、VMess 及其他协议 | 明确协议版本、实现来源、客户端互通与维护成本后排期 |
+| 单独立项 | Shadowsocks 2022/传统 AEAD、REALITY、Vision、XHTTP、VMess 及其他协议 | 明确协议版本、实现来源、客户端互通与维护成本后排期 |
 
 SS2022 延后到后续扩展。其 `set_user_manager` 提供 EIH 多用户入口，但仍须单独验证在线替换、身份回传和撤销能否接入统一策略，不能用单密码服务器冒充多用户支持。
 
 同样，“使用 Quinn”只提供 QUIC 传输能力，不自动获得 TUIC/Hysteria2 认证、HTTP/3、混淆、拥塞行为或线协议兼容性。每种协议用明确的功能组合声明能力，例如密码套件、TCP/UDP、传输、安全层、插件、mux 和 UoT，而非一个笼统的“支持”开关。
 
-首版 TLS 可先支持 `file` 和持久化 `self` 证书；`http`/`dns` 自动签发单独实现并声明能力。不能将面板要求的 ACME 模式默默改成自签。
+当前 TLS 支持 `file` 和操作者提供本地 PEM 的 `self` 证书，均不自动生成；`http`/`dns` 自动签发单独实现并声明能力。不能将面板要求的 ACME 模式默默改成自签。
 
 ## 10 配置与运行方式
 
@@ -310,11 +310,11 @@ SS2022 延后到后续扩展。其 `set_user_manager` 提供 EIH 多用户入口
 
 密钥通过权限受控的文件或环境变量注入，避免命令行参数泄漏。HTTP 客户端在错误中只输出端点路径、状态和请求标识；不打印完整带 query 的 URL、UUID、证书私钥或面板响应体。显式配置面板 API 前缀，路径拼接不能丢失前缀。
 
-check、capabilities、version 和 VLESS run 已实现：
+check、capabilities、version 和多协议 run 已实现：
 
 | 命令 | 行为 |
 | --- | --- |
-| `terraris run --config …` | 已实现：同步配置/用户并运行 VLESS；不支持的协议组合会拒绝 |
+| `terraris run --config …` | 已实现：同步配置/用户并运行 VLESS、Trojan、AnyTLS；不支持的协议组合会拒绝 |
 | `terraris check --config …` | 本地配置检查，无网络请求 |
 | `terraris check --config … --panel` | 只读拉取并校验面板配置及用户；不申请设备、不上报、不监听 |
 | `terraris capabilities` | 显示本构建支持的协议与功能组合 |
@@ -322,7 +322,7 @@ check、capabilities、version 和 VLESS run 已实现：
 
 首版部署形态为 systemd 服务与容器镜像；两个实例不能共享同一状态目录。启动时取得该目录的独占锁。配置默认位于 `/etc/terraris/`，状态位于 `/var/lib/terraris/`，具体路径可以覆盖。
 
-证书与私钥先验证再发布；自签证书持久保存，重启不重新生成。按协议作用域在状态请求中发送 `X-Node-Certificate-SHA256`，防止不同入站的指纹互相覆盖。
+证书与私钥先验证再发布；自签证书由操作者生成并持久保存。文件变化在下次配置同步时触发热重载，失败保留旧身份；见 [TLS 协议文档](tls-protocols.md)。按协议作用域在状态请求中发送 `X-Node-Certificate-SHA256`，防止不同入站的指纹互相覆盖。
 
 收到 SIGTERM 后停止接受新会话、取消轮询，限时排空连接，收集末次计数，提交本地队列并在剩余时间内尝试上报，然后回收所有任务。面板不可达不能无限拖延退出，持久化批次留待下次处理。
 

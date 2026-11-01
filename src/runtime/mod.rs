@@ -96,6 +96,9 @@ pub trait PreparedListener: Send + Sync {
 
 #[async_trait]
 pub trait ProtocolDriver: users::AuthUpdater + Send + Sync {
+    fn reload_required(&self) -> Result<bool, Error> {
+        Ok(false)
+    }
     async fn prepare_listener(
         &self,
         context: &OperationContext,

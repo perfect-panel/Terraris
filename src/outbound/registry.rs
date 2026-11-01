@@ -185,7 +185,7 @@ impl Factory for ProxyFactory {
 #[async_trait]
 impl Connector for Proxy {
     fn supports(&self, network: Network) -> bool {
-        network == Network::Tcp || self.kind != super::Kind::Http
+        network == Network::Tcp || self.uot.is_some() || self.kind != super::Kind::Http
     }
     async fn connect(
         &self,

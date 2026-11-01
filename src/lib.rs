@@ -4,6 +4,7 @@
 
 pub mod app;
 pub mod buffer;
+pub mod certificate;
 pub mod codec;
 pub mod config;
 pub mod controller;

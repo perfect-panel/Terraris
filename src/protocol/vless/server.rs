@@ -2,10 +2,10 @@
 use super::{
     egress::Egress,
     encryption,
-    ingress::{Ingress, Registry},
     options::{self, Options},
     wire,
 };
+use crate::protocol::ingress::{Ingress, Registry};
 use crate::{
     buffer::BufferScope,
     dataplane::{DataPlane, TransferConfig},
@@ -204,6 +204,7 @@ impl RuntimeFactory for Factory {
             options: self.options.clone(),
             address: SocketAddr::new(self.options.listen, config.port),
             transport,
+            uot: config.uot,
             encryption: Mutex::new(encrypted),
             client,
             policies: self.policies.clone(),
@@ -231,6 +232,7 @@ pub(super) struct Driver {
     pub(super) options: Options,
     address: SocketAddr,
     transport: Arc<dyn crate::transport::Inbound>,
+    uot: bool,
     encryption: Mutex<Option<Arc<encryption::Server>>>,
     pub(super) client: Arc<dyn ProtocolClient>,
     pub(super) policies: Arc<Policies>,
@@ -388,6 +390,33 @@ impl Driver {
             Deadline::after(self.options.handshake_timeout)
                 .map_err(|_| flow::Error::InvalidOptions)?,
         );
+        if let Some(version) = crate::protocol::uot::Version::for_target(target) {
+            if !self.uot {
+                return Err(flow::Error::InvalidOptions);
+            }
+            session
+                .run(wire::write_response(&mut stream))
+                .await?
+                .map_err(|_| flow::Error::Io(std::io::ErrorKind::BrokenPipe))?;
+            let codec = context
+                .run(version.read(&mut stream))
+                .await
+                .map_err(|_| flow::Error::Stopped)?
+                .map_err(|error| flow::Error::Io(error.kind()))?;
+            return crate::protocol::stream::relay::udp(
+                stream,
+                codec,
+                self.egress.clone(),
+                session,
+                buffers,
+                crate::protocol::stream::relay::UdpOptions {
+                    idle: self.options.udp_idle_timeout,
+                    operation_timeout: self.options.handshake_timeout,
+                    max_ports: 32,
+                },
+            )
+            .await;
+        }
         let upstream = session
             .run(self.egress.connect(target, &context, buffers.clone()))
             .await?
@@ -480,6 +509,11 @@ impl PreparedListener for Listener {
 }
 #[async_trait]
 impl ProtocolDriver for Driver {
+    fn reload_required(&self) -> Result<bool, runtime::Error> {
+        self.transport
+            .reload_required()
+            .map_err(|_| runtime::Error::Preparation("TLS identity reload"))
+    }
     fn certificate(&self) -> Option<crate::panel::CertificateFingerprint> {
         self.transport.certificate()
     }
@@ -496,7 +530,9 @@ impl ProtocolDriver for Driver {
                 context,
             )
             .await?;
-        binding.register(self.weak.clone())?;
+        let acceptor: Arc<dyn crate::protocol::ingress::Acceptor> =
+            self.weak.upgrade().ok_or(runtime::Error::Closed)?;
+        binding.register(Arc::downgrade(&acceptor))?;
         *self.binding.lock().unwrap_or_else(|e| e.into_inner()) = Some(binding);
         Ok(Box::new(Listener(self.weak.clone())))
     }
@@ -571,5 +607,17 @@ impl crate::protocol::InboundFactory for Factory {
         context: &OperationContext,
     ) -> Result<Arc<dyn ProtocolDriver>, runtime::Error> {
         RuntimeFactory::prepare_protocol(self, config, shared, core, context).await
+    }
+}
+
+impl crate::protocol::ingress::Acceptor for Driver {
+    fn closed(&self) -> bool {
+        Driver::closed(self)
+    }
+    fn accepting(&self) -> bool {
+        Driver::accepting(self)
+    }
+    fn accept(self: Arc<Self>, stream: Stream, source: SocketAddr) {
+        Driver::accept(&self, stream, source);
     }
 }

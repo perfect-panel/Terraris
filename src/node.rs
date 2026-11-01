@@ -30,6 +30,7 @@ pub struct Settings {
     pub max_connections: usize,
     pub max_handshakes: usize,
     pub max_xudp_sessions: usize,
+    pub max_streams: usize,
     pub queue_packets: usize,
     pub max_xudp_associations: usize,
     pub xudp_resume_timeout_seconds: u64,
@@ -55,6 +56,7 @@ impl Default for Settings {
             max_connections: 4096,
             max_handshakes: 128,
             max_xudp_sessions: 32,
+            max_streams: 32,
             queue_packets: 32,
             max_xudp_associations: 1024,
             xudp_resume_timeout_seconds: 60,
@@ -74,6 +76,8 @@ impl Settings {
     pub fn validate(&self) -> Result<(), Error> {
         if self.connection_memory_bytes > self.memory_bytes
             || self.connection_buffer_slots > self.buffer_slots
+            || self.max_streams == 0
+            || self.max_streams > 1024
             || self.max_users == 0
             || self.max_users > 1_000_000
             || self.report_entries == 0
@@ -165,18 +169,39 @@ impl Node {
         dns: crate::dns::Settings,
         routing: crate::route::Settings,
     ) -> Result<Self, Error> {
+        Self::with_tls(
+            options,
+            settings,
+            dns,
+            routing,
+            crate::certificate::Settings::default(),
+        )
+    }
+    pub fn with_tls(
+        options: panel::ppanel::Options,
+        settings: Settings,
+        dns: crate::dns::Settings,
+        routing: crate::route::Settings,
+        tls: crate::certificate::Settings,
+    ) -> Result<Self, Error> {
         let protocol_options = settings.protocol_options()?;
+        let stream_options = crate::protocol::stream::Options {
+            max_streams: settings.max_streams,
+            ..(&protocol_options).into()
+        };
         let policy_options = flow::Options {
             max_entries: settings.max_users,
             device_timeout: options.timeout.min(Duration::from_secs(10)),
         };
         Self::with_registry(options, settings, move |connection, metrics| {
-            crate::protocol::Registry::builtin(
+            crate::protocol::Registry::with_stream_options(
                 connection,
                 protocol_options,
+                stream_options,
                 policy_options,
                 dns,
                 routing,
+                tls,
                 metrics,
             )
         })
@@ -220,9 +245,9 @@ impl Node {
                     report_entries: settings.report_entries,
                     users: users::Limits {
                         max_users: settings.max_users,
-                        max_sessions: settings
-                            .max_connections
-                            .saturating_mul(settings.max_xudp_sessions + 1),
+                        max_sessions: settings.max_connections.saturating_mul(
+                            settings.max_xudp_sessions.max(settings.max_streams) + 1,
+                        ),
                         max_age: Duration::from_secs(settings.user_max_age_seconds),
                     },
                     operation_timeout: timeout,

@@ -917,3 +917,100 @@ async fn tls_transport_cancellation_drops_unfinished_handshake_socket() {
     let result = ctx().run(peer.read_to_end(&mut Vec::new())).await.unwrap();
     assert!(result.is_ok() || result.unwrap_err().kind() == std::io::ErrorKind::ConnectionReset);
 }
+
+#[tokio::test]
+async fn uot_v1_v2_outbounds_use_existing_socks_http_and_vless_tcp_carriers() {
+    use terraris::protocol::socksaddr::{Endpoint, Format, Host};
+    for protocol in ["socks5", "http", "vless"] {
+        for version in [1, 2] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy = listener.local_addr().unwrap();
+            let magic = if version == 1 {
+                "sp.udp-over-tcp.arpa"
+            } else {
+                "sp.v2.udp-over-tcp.arpa"
+            };
+            let server = tokio::spawn(async move {
+                let (mut io, _) = listener.accept().await.unwrap();
+                match protocol {
+                    "socks5" => {
+                        let mut greeting = [0; 3];
+                        io.read_exact(&mut greeting).await.unwrap();
+                        assert_eq!(greeting, [5, 1, 0]);
+                        io.write_all(&[5, 0]).await.unwrap();
+                        let mut request = [0; 3];
+                        io.read_exact(&mut request).await.unwrap();
+                        assert_eq!(request, [5, 1, 0]);
+                        let address = Endpoint::read(&mut io, Format::Socks).await.unwrap();
+                        assert_eq!(address.host, Host::Domain(magic.into()));
+                        io.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 1])
+                            .await
+                            .unwrap();
+                    }
+                    "http" => {
+                        let mut header = Vec::new();
+                        while !header.ends_with(b"\r\n\r\n") {
+                            header.push(io.read_u8().await.unwrap());
+                        }
+                        assert!(
+                            header
+                                .starts_with(format!("CONNECT {magic}:1 HTTP/1.1\r\n").as_bytes())
+                        );
+                        io.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await.unwrap();
+                    }
+                    "vless" => {
+                        let request = terraris::protocol::vless::wire::Request::read(&mut io)
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            request.target.unwrap().domain_name().unwrap().as_str(),
+                            magic
+                        );
+                        io.write_all(&[0, 0]).await.unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                if version == 2 {
+                    let mut request = [0; 8];
+                    io.read_exact(&mut request).await.unwrap();
+                    assert_eq!(request, [0, 1, 0, 0, 0, 0, 0, 0]);
+                }
+                for payload in [&b""[..], &b"uot payload"[..]] {
+                    let mut header = [0; 9];
+                    io.read_exact(&mut header).await.unwrap();
+                    assert_eq!(&header[..7], &[0, 127, 0, 0, 1, 0x12, 0x34]);
+                    assert_eq!(
+                        u16::from_be_bytes([header[7], header[8]]) as usize,
+                        payload.len()
+                    );
+                    let mut data = vec![0; payload.len()];
+                    io.read_exact(&mut data).await.unwrap();
+                    assert_eq!(data, payload);
+                    io.write_all(&header).await.unwrap();
+                    io.write_all(&data).await.unwrap();
+                }
+            });
+            let mut outbound = json!({"name":"proxy","protocol":protocol,"address":"127.0.0.1","port":proxy.port(),"uot":true,"uot_version":version,"rules":["127.0.0.1"]});
+            if protocol == "vless" {
+                outbound["uuid"] = json!("b831381d-6324-4d53-ad4f-8cda48b30811");
+            }
+            let config = config(json!({"outbound":[outbound]})).await;
+            let (registry, handle, budget, scope) = engine(&config).await;
+            let target = Address::from_socket("127.0.0.1:4660".parse().unwrap()).unwrap();
+            let plan = handle.plan(&target, Network::Udp, &ctx()).await.unwrap();
+            let port = handle.packet(&plan, scope, &ctx()).await.unwrap();
+            for payload in [&b""[..], &b"uot payload"[..]] {
+                port.send(&target, payload, &ctx()).await.unwrap();
+                let packet = port.recv(&ctx()).await.unwrap();
+                assert_eq!(packet.source, target);
+                assert_eq!(packet.payload.as_slice(), payload);
+            }
+            drop(port);
+            drop(plan);
+            handle.close(&ctx()).await.unwrap();
+            registry.close(&ctx()).await.unwrap();
+            server.await.unwrap();
+            assert_eq!(budget.snapshot().used().bytes(), 0);
+        }
+    }
+}

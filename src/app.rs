@@ -119,11 +119,13 @@ pub async fn run() -> Result<(), Error> {
                 "infrastructure: tracked tasks, monotonic deadlines, budgeted TCP/UDP I/O, bounded codecs, metrics"
             );
             println!(
-                "proxy protocols: {} (TCP, UDP, XUDP; mlkem768x25519plus)",
-                crate::protocol::vless::NAME
+                "proxy protocols: {}, {}, {} (TCP; UDP/XUDP/UoT; mlkem768x25519plus)",
+                crate::protocol::vless::NAME,
+                crate::protocol::trojan::NAME,
+                crate::protocol::anytls::NAME
             );
             println!(
-                "transports: {} (raw alias; inbound/outbound), TLS client layer; VLESS encryption native/xorpub/random, 1-RTT/0-RTT",
+                "transports: {} (raw alias; inbound/outbound), TLS server/client via rustls/aws-lc-rs; VLESS encryption native/xorpub/random, 1-RTT/0-RTT",
                 crate::transport::Registry::builtin()
                     .names()
                     .collect::<Vec<_>>()
@@ -180,8 +182,9 @@ pub async fn run() -> Result<(), Error> {
 async fn run_node(path: PathBuf) -> Result<(), Error> {
     let config = config::Config::load(&path).map_err(Error::Config)?;
     let options = config.connection_options(&path).map_err(Error::Config)?;
-    let node = crate::node::Node::with_network(options, config.node, config.dns, config.routing)
-        .map_err(Error::Node)?;
+    let node =
+        crate::node::Node::with_tls(options, config.node, config.dns, config.routing, config.tls)
+            .map_err(Error::Node)?;
     let cancellation = crate::task::CancellationToken::new();
     let context = crate::time::OperationContext::new(cancellation.clone(), None);
     let run = async {

@@ -309,9 +309,130 @@ impl Drop for FrameWrite {
     }
 }
 
+pub(crate) struct FramedPacket {
+    read: Mutex<crate::protocol::packet::Reader<ReadHalf<Stream>>>,
+    write: Mutex<WriteHalf<Stream>>,
+    codec: crate::protocol::packet::Codec,
+    cancel: CancellationToken,
+}
+impl FramedPacket {
+    pub(crate) fn new(
+        stream: Stream,
+        codec: crate::protocol::packet::Codec,
+        scope: BufferScope,
+    ) -> Self {
+        let (read, write) = tokio::io::split(stream);
+        Self {
+            read: Mutex::new(crate::protocol::packet::Reader::new(
+                read,
+                codec.clone(),
+                scope,
+            )),
+            write: Mutex::new(write),
+            codec,
+            cancel: CancellationToken::new(),
+        }
+    }
+}
+#[async_trait]
+impl PacketPort for FramedPacket {
+    async fn send(
+        &self,
+        target: &Address,
+        payload: &[u8],
+        context: &OperationContext,
+    ) -> Result<(), Error> {
+        let mut write = context
+            .run(self.write.lock())
+            .await
+            .map_err(Error::Stopped)?;
+        let mut guard = PacketWriteGuard {
+            cancel: self.cancel.clone(),
+            complete: false,
+        };
+        let result = tokio::select! {biased;_=self.cancel.cancelled()=>Err(Error::Closed),result=context.run(crate::protocol::packet::write(&mut *write,&self.codec,target,payload))=>result.map_err(Error::Stopped).and_then(|result| result.map_err(Error::from))};
+        guard.complete = result.is_ok();
+        // A partially emitted frame cannot be reused after a cancelled write.
+        if result.is_err() {
+            self.cancel.cancel();
+        }
+        result
+    }
+    async fn recv(&self, context: &OperationContext) -> Result<Packet, Error> {
+        let mut read = context
+            .run(self.read.lock())
+            .await
+            .map_err(Error::Stopped)?;
+        let result = tokio::select! {biased;_=self.cancel.cancelled()=>return Err(Error::Closed),result=context.run(read.next())=>result.map_err(Error::Stopped)?};
+        match result {
+            Ok(Some(packet)) => Ok(Packet {
+                source: packet.address,
+                payload: packet.payload,
+            }),
+            Ok(None) => {
+                self.abort();
+                Err(Error::Closed)
+            }
+            Err(error) => {
+                self.abort();
+                Err(error.into())
+            }
+        }
+    }
+    fn abort(&self) {
+        self.cancel.cancel();
+    }
+}
+impl Drop for FramedPacket {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+struct PacketWriteGuard {
+    cancel: CancellationToken,
+    complete: bool,
+}
+impl Drop for PacketWriteGuard {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.cancel.cancel();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn dropped_partial_uot_write_closes_both_directions() {
+        let budget =
+            crate::resource::Budget::new(crate::resource::Limits::new(1 << 20, 32).unwrap());
+        let scope = BufferScope::new(budget.root_scope(), 128 << 10).unwrap();
+        let (a, _b) = tokio::io::duplex(1);
+        let port = FramedPacket::new(
+            Box::new(a),
+            crate::protocol::packet::Codec::Uot { connected: None },
+            scope,
+        );
+        let target = Address::from_domain("test.example", 53).unwrap();
+        let context = OperationContext::new(CancellationToken::new(), None);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                port.send(&target, b"payload", &context)
+            )
+            .await
+            .is_err()
+        );
+        assert!(matches!(
+            port.send(&target, b"later", &context).await,
+            Err(Error::Closed)
+        ));
+        assert!(matches!(port.recv(&context).await, Err(Error::Closed)));
+        drop(port);
+        assert_eq!(budget.snapshot().used().bytes(), 0);
+    }
     #[tokio::test]
     async fn dropped_partial_xudp_write_poison_carrier() {
         let budget =

@@ -24,6 +24,8 @@ pub struct Config {
     pub dns: crate::dns::Settings,
     #[serde(default)]
     pub routing: crate::route::Settings,
+    #[serde(default)]
+    pub tls: crate::certificate::Settings,
 }
 
 #[derive(Deserialize)]
@@ -91,6 +93,7 @@ impl Config {
                 *asset = base.join(&*asset);
             }
         }
+        config.tls.resolve_paths(base);
         Ok(config)
     }
 
@@ -116,6 +119,9 @@ impl Config {
             .limits
             .validate()
             .map_err(|_| Error("invalid routing limits"))?;
+        self.tls
+            .validate()
+            .map_err(|_| Error("invalid TLS certificate settings"))?;
         let p = &self.panel;
         if p.secret_env.is_some() == p.secret_file.is_some() {
             return Err(Error(

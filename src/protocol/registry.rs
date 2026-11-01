@@ -91,7 +91,53 @@ impl Registry {
         routing: crate::route::Settings,
         metrics: Metrics,
     ) -> Result<Self, Error> {
-        let transports = Arc::new(crate::transport::Registry::builtin());
+        Self::with_tls(
+            connection,
+            options,
+            policy,
+            dns,
+            routing,
+            crate::certificate::Settings::default(),
+            metrics,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_tls(
+        connection: Arc<dyn crate::panel::Connection>,
+        options: super::vless::Options,
+        policy: super::flow::Options,
+        dns: crate::dns::Settings,
+        routing: crate::route::Settings,
+        tls: crate::certificate::Settings,
+        metrics: Metrics,
+    ) -> Result<Self, Error> {
+        let stream_options = (&options).into();
+        Self::with_stream_options(
+            connection,
+            options,
+            stream_options,
+            policy,
+            dns,
+            routing,
+            tls,
+            metrics,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_stream_options(
+        connection: Arc<dyn crate::panel::Connection>,
+        options: super::vless::Options,
+        stream_options: super::stream::Options,
+        policy: super::flow::Options,
+        dns: crate::dns::Settings,
+        routing: crate::route::Settings,
+        tls: crate::certificate::Settings,
+        metrics: Metrics,
+    ) -> Result<Self, Error> {
+        let transports = Arc::new(
+            crate::transport::Registry::with_tls(tls)
+                .map_err(|_| Error::Preparation("TLS settings"))?,
+        );
         let egress = egress::Registry::with_providers(
             dns,
             routing,
@@ -101,16 +147,36 @@ impl Registry {
         )
         .map_err(|_| Error::Preparation("egress settings"))?;
         let vless = Arc::new(super::vless::Factory::with_services(
-            connection,
-            options,
+            connection.clone(),
+            options.clone(),
             policy,
             egress.clone(),
-            transports,
+            transports.clone(),
             metrics.clone(),
         )?);
         let mut builder = Self::builder(egress, metrics);
         builder
             .register(super::vless::NAME, &[], vless)
+            .map_err(|_| Error::Preparation("builtin protocols"))?;
+        let trojan = Arc::new(super::stream::Factory::new(
+            connection.clone(),
+            Arc::new(super::trojan::Factory),
+            transports.clone(),
+            stream_options.clone(),
+            policy,
+        )?);
+        builder
+            .register(super::trojan::NAME, &[], trojan)
+            .map_err(|_| Error::Preparation("builtin protocols"))?;
+        let anytls = Arc::new(super::stream::Factory::new(
+            connection,
+            Arc::new(super::anytls::Factory),
+            transports,
+            stream_options,
+            policy,
+        )?);
+        builder
+            .register(super::anytls::NAME, &[], anytls)
             .map_err(|_| Error::Preparation("builtin protocols"))?;
         builder
             .build()

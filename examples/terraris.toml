@@ -13,7 +13,7 @@ max_request_bytes = 8388608
 [node]
 # Protocol ports, users and Encryption settings are supplied by PPanel.
 listen = "0.0.0.0"
-# Without Encryption, use a trusted loopback transport or explicitly opt in.
+# Without VLESS Encryption or TLS, use loopback or explicitly opt in.
 allow_plaintext = false
 memory_bytes = 67108864
 buffer_slots = 16384
@@ -22,6 +22,7 @@ connection_buffer_slots = 256
 max_connections = 4096
 max_handshakes = 128
 max_xudp_sessions = 32
+max_streams = 32 # AnyTLS logical streams per TLS session
 max_xudp_associations = 1024
 xudp_resume_timeout_seconds = 60
 xudp_detached_packets = 8
@@ -62,3 +63,13 @@ max_regex = 256
 regex_bytes = 1048576
 max_categories = 128
 asset_bytes = 134217728
+
+# Local PEM identities for TLS inbounds (paths relative to this TOML file).
+# TLS is required by Trojan and AnyTLS; VLESS can also select security=tls.
+# [tls]
+# cert_file = "tls/fullchain.pem"
+# key_file = "tls/privkey.pem"
+# Optional per-protocol override:
+# [tls.protocols.anytls]
+# cert_file = "tls/anytls-fullchain.pem"
+# key_file = "tls/anytls-privkey.pem"

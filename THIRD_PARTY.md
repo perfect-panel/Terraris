@@ -24,8 +24,16 @@ VLESS Encryption uses arbitrary binary contexts for BLAKE3 derivation; the stand
 
 ## Test-only Xray peers
 
-[tests/interop/encryption](tests/interop/encryption) is a separate Go module pinned to the same Xray commit. It is an optional interoperability test driver, not a Rust build dependency or a production process. The full Xray binary used by the end-to-end test is built from that same module version. Normal `cargo test` uses committed deterministic vectors and loopback Rust tests; the three external-peer tests are explicitly ignored until their binary paths are provided.
+[tests/interop/encryption](tests/interop/encryption) is a separate Go module pinned to the same Xray commit. It is an optional interoperability test driver, not a Rust build dependency or a production process. The full Xray binary used by the end-to-end test is built from that same module version. Normal `cargo test` uses committed deterministic vectors and loopback Rust tests; the external-peer tests are explicitly ignored until their binary paths are provided.
 
 ## Routing and DNS
 
 The GeoSite/GeoIP protobuf field definitions follow the Xray `app/router` data format. The built-in private-address prefix list retains Polaris's routing semantics. Runtime selectors, range indexes, resource limits and transactional asset loading are implemented in Rust. DNS wire messages are encoded/decoded by `hickory-proto`; the resolver lifecycle, scoped selection, cache and transports are managed by Terraris. DoH follows RFC 8484 and DoT follows RFC 7858, with certificate verification supplied by rustls.
+
+## Trojan, AnyTLS and UoT
+
+Trojan framing follows the [official protocol](https://github.com/trojan-gfw/trojan/blob/master/docs/protocol.md). AnyTLS v1/v2 framing, settings and the public default padding policy follow [anytls-go at fd6167acd6d73b9fa3e607659951847fbc9e6c50](https://github.com/anytls/anytls-go/tree/fd6167acd6d73b9fa3e607659951847fbc9e6c50). UDP over TCP follows the [SagerNet specification](https://sing-box.sagernet.org/configuration/shared/udp-over-tcp/) and `github.com/sagernet/sing/common/uot` v0.5.1 (GPL-3.0-or-later). Rust codecs and runtime integration are implemented here; no Go runtime is embedded.
+
+[tests/interop/proxy](tests/interop/proxy) is an optional Go peer pinned to those upstream modules. It uses the actual upstream AnyTLS session client and UoT implementation to exercise the Rust server. The pinned Xray binary also exercises Trojan TCP/UDP. These helpers are not production dependencies.
+
+TLS identities use rustls with its explicit aws-lc-rs provider. The Rust `md-5` dependency identifies the public AnyTLS padding policy only; it is not used for authentication, signing or encryption. User authentication uses SHA-224 (Trojan) or SHA-256 (AnyTLS) as required by their wire formats.

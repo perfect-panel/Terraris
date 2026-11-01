@@ -37,6 +37,9 @@ pub trait Listener: Send + Sync {
 }
 #[async_trait]
 pub trait Inbound: Send + Sync {
+    fn reload_required(&self) -> Result<bool, Error> {
+        Ok(false)
+    }
     /// The provider must validate and enforce transport security before returning
     /// true. VLESS can then omit its own encryption without allow_plaintext.
     fn is_encrypted(&self) -> bool {
@@ -122,6 +125,14 @@ impl Registry {
     }
     pub fn builtin() -> Self {
         Self::builtin_builder().build()
+    }
+    pub fn with_tls(settings: crate::certificate::Settings) -> Result<Self, Error> {
+        settings.validate()?;
+        let mut builder = Self::builder();
+        builder
+            .register("tcp", &["raw"], Arc::new(TcpWithTls(settings)))
+            .map_err(|_| Error::Configuration("TCP registration"))?;
+        Ok(builder.build())
     }
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.providers.entries().map(|(name, _)| name)
@@ -297,5 +308,72 @@ impl Outbound for TcpClient {
             return Ok((stream, peer));
         }
         Err(last)
+    }
+}
+
+struct TcpWithTls(crate::certificate::Settings);
+impl Factory for TcpWithTls {
+    fn inbound(&self, config: &panel::ProtocolConfig) -> Result<Arc<dyn Inbound>, Error> {
+        if config.security != "tls" {
+            return Tcp.inbound(config);
+        }
+        if !matches!(config.cert_mode.as_str(), "" | "file" | "self")
+            || config.allow_insecure
+            || config.disable_sni
+            || !config.cert_dns_provider.is_empty()
+            || !config.cert_dns_env.expose().is_empty()
+        {
+            return Err(Error::Unsupported);
+        }
+        let mut plain = config.clone();
+        plain.security.clear();
+        plain.cert_mode.clear();
+        plain.sni.clear();
+        plain.alpn.clear();
+        Tcp.inbound(&plain)?; // Reject all other unsupported transport fields.
+        Ok(Arc::new(TlsInbound(self.0.prepare(config)?)))
+    }
+    fn outbound(
+        &self,
+        config: &panel::Outbound,
+        roots: Arc<rustls::ClientConfig>,
+    ) -> Result<Arc<dyn Outbound>, Error> {
+        Tcp.outbound(config, roots)
+    }
+}
+struct TlsInbound(crate::certificate::Identity);
+#[async_trait]
+impl Inbound for TlsInbound {
+    fn binding_key(&self) -> &str {
+        "tcp"
+    }
+    fn is_encrypted(&self) -> bool {
+        true
+    }
+    fn certificate(&self) -> Option<panel::CertificateFingerprint> {
+        Some(self.0.fingerprint.clone())
+    }
+    fn reload_required(&self) -> Result<bool, Error> {
+        self.0.reload_required()
+    }
+    async fn bind(
+        &self,
+        address: SocketAddr,
+        context: &OperationContext,
+    ) -> Result<Box<dyn Listener>, Error> {
+        Tcp.bind(address, context).await
+    }
+    async fn handshake(
+        &self,
+        stream: Stream,
+        _: &BufferScope,
+        context: &OperationContext,
+    ) -> Result<Stream, Error> {
+        let stream = context
+            .run(tokio_rustls::TlsAcceptor::from(self.0.config.clone()).accept(stream))
+            .await
+            .map_err(Error::Stopped)?
+            .map_err(|_| Error::Tls)?;
+        Ok(Box::new(stream))
     }
 }
