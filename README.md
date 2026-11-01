@@ -2,7 +2,7 @@
 
 Terraris 是参考 Polaris 架构设计的 PPanel Rust 节点端项目，负责代理协议接入、用户认证、限速与设备准入，以及节点状态、在线设备和流量上报。
 
-当前已完成 Rust 基础工程、PPanel 面板客户端，以及 B1/B2 的 resource/buffer 模块。代理协议、Supervisor/Controller 运行循环、限速执行及持久化上报尚未实现；当前二进制用于配置与只读联通检查，不监听代理端口或自动上报在线状态。
+当前已完成 Rust 基础工程、PPanel 面板客户端，以及 B1–B3 的 buffer、任务、时间、网络 I/O、codec 和指标模块。代理协议、Supervisor/Controller、限速执行及持久化上报尚未实现；二进制仍用于配置与只读检查，基础设施通过 library API 使用，不自动启动代理或指标监听器。
 
 - [架构设计](docs/architecture.md)：模块边界、状态管理、协议规划、故障处理与实施阶段。
 - [PPanel 接口契约](docs/ppanel-api.md)：当前 backend 的实际接口、身份与计量语义、兼容性要求。
@@ -22,6 +22,9 @@ Terraris 是参考 Polaris 架构设计的 PPanel Rust 节点端项目，负责�
 - 订阅 ID 保持 int64 精度，规范化 Hysteria 协议名和 IPv4-mapped 地址，按协议读取当前证书指纹。
 - resource 支持进程/多级作用域的字节与分配数量上限、原子批量预留、Reserved/Resident 快照、RAII 归还及关闭语义。
 - buffer 提供固定容量 BufferLease、SharedBuffer 共享切片和 Bytes 所有权适配；支持受限缓存池、混合批量预留，以及字节/消息双限额队列。
+- task/time 提供有上限的任务组、取消传播、等待与 abort 后回收、单调截止时间和独立的 Unix 毫秒类型。
+- network/dataplane 提供未解析地址元数据、TCP 连接与有预算的双向转发、UDP 收发和超限检测；codec 提供有界基本类型/地址读写及增量长度帧。
+- telemetry 提供固定维度原子计数、RAII 活动指标、快照和 Prometheus 文本，不保存用户地址或 payload 标签。
 
 设备租约、用户限制和流量接口目前由 library 暴露；这不代表已经有数据面执行这些策略。
 
@@ -35,7 +38,7 @@ Terraris 是参考 Polaris 架构设计的 PPanel Rust 节点端项目，负责�
 - `BufferLayout` 定义 headroom + payload capacity + tailroom 的逻辑大小。普通 BufferScope 按精确大小分配，池化 Scope 可能选择更大类别；预算按完整 backing capacity 计量，多余容量不扩大可写范围。
 - payload 不能占用 trailer 预留；添加 trailer 后 payload 封口。consume/truncate 后要先 clear 才能重新封包。clear 清空逻辑范围，不释放容量，也不承诺安全擦除。
 - `read_from` 只提交成功读取的 filled 字节；空间耗尽是错误，不会冒充 EOF。取消持有 buffer 的任务后，等待其结束才能确认资源已经归还。
-- close 阻止新的预留和子作用域，不撤销现有拥有者；关闭前取得的 Reservation 仍可提交。取消任务与强制结束由后续 TaskGroup 层负责。
+- close 阻止新的预留和子作用域，不撤销现有拥有者；关闭前取得的 Reservation 仍可提交。任务取消与等待回收通过 TaskGroup 管理。
 
 当前预算约束的是受管理存储容量及分配名额，不能当作进程 RSS 上限。元数据、分配器开销和外部网络库内存不在字节口径内。批量预留只覆盖同一个作用域，跨分支组合预留尚未提供。
 
@@ -53,6 +56,29 @@ Terraris 是参考 Polaris 架构设计的 PPanel Rust 节点端项目，负责�
 BufferScope 的物理容量申请仍是同步 try 操作；B2 的异步等待只针对队列容量，并要求 deadline。PoolSnapshot 提供闲置/准备中/借出容量与命中、未命中、淘汰计数；QueueSnapshot 区分排队、已预留和等待者。资源 Budget 是硬额度的依据，各层指标快照不构成跨锁事务。
 
 Bytes 自己创建的空切片可能不保留原 owner，转为 BytesMut 或其他容器也可能产生预算外复制；不要把外部 Bytes 的全部行为当作 SharedBuffer 的预算契约。SharedBuffer 的 Debug 隐藏数据，Bytes 仍有原生 Debug 行为。Rustdoc 包含池和队列的可执行示例。
+
+## B3 任务 时间 I/O 与 Codec
+
+| API | 当前行为 |
+| --- | --- |
+| `TaskGroup` | 保留所有句柄，上限包含已完成但未 join 的任务；join/try_join 回收结果与名额 |
+| `TaskGroup::shutdown` | 停止接入并取消子任务，截止时间后 abort，再等待全部 join；Drop 只作取消/abort 兜底 |
+| `OperationContext` / `Deadline` | 单调时间、可选绝对截止时间、子取消域；子期限只能收紧，已停止时不 poll 工作 future |
+| `UnixMillis` | 系统时间的 Unix 毫秒转换，检查纪元前时间及溢出，与单调时间分开 |
+| `Address` / `FlowMetadata` | 保留 IP/域名目标、端口、源和网络类型；域名接受 ASCII/IDNA ASCII，不自动 DNS 查询 |
+| `DataPlane` | 原子预留双向 buffer，处理短写、WriteZero、EOF、flush、半关闭、取消与共享空闲超时 |
+| `DatagramEndpoint` | 收/发 poll 各自串行化，使用 payload limit + 1 接收窗口；超限包不发布，空包有效，部分发送不重发 |
+| `Reader` / `Writer` | 有界整数读写与 RFC 1928 目的地址前缀；复合读取失败回退 cursor，写入失败不产生半个前缀 |
+| `FrameDecoder` | u16/u32 大端长度帧，逐块输入，一次至多输出一个 SharedBuffer；失败释放部分帧并 poison 状态 |
+| `Metrics` | 固定计数和活动 gauge、无动态标签的 Prometheus 文本；资源/池/队列仍使用各自快照 |
+
+任务只支持可协作的异步 future。Tokio abort 无法抢占阻塞或不让出执行权的代码，shutdown 等待 join 确认回收，不承诺能在指定时间内终止这类代码。隐式 Drop 不确认异步回收；任务结果计数在 join 时更新。TaskReport 不保存 panic payload，宿主 panic hook 仍由宿主配置。
+
+TCP 空闲时间由两个方向的读写进展共享，一侧安静不影响另一侧持续传输；绝对截止时间独立生效。失败返回已成功写入的前缀计数，TransferObserver 在每次成功写后、下一次 await 前收到通知。计数表示 AsyncWrite 接受的字节，不等于远端确认；观测计数饱和累加，不能代替持久化计费账本。借用/共享传输包装器的最终关闭由其拥有者负责。
+
+UDP 的 local_addr 是绑定地址，通配绑定时不表示具体目的 IP。65535 是适配器配置上界，宿主发送限制可能更小；真实回环测试使用 8 KiB，完整边界用传输夹具验证。指标只将通过大小检查的接收包及完整发送计为成功；没有协议解析或 NAT 会话管理。
+
+FrameDecoder 的 consumed 指明本次消费量，剩余输入由调用方保留。解码失败要求关闭流，或只在已知帧边界 reset，不能盲目重试。这些长度帧与地址组件不表示已实现 SOCKS 或其他代理协议。Rustdoc 提供可执行用法示例。
 
 ## 构建与本地检查
 
@@ -105,6 +131,8 @@ cargo build --locked --release
 测试使用本地 HTTP 模拟面板，覆盖全部端点、两种编码、条件请求、大小限制、取消、错误脱敏及报告不重试。另有[使用 backend Go 绑定生成的互操作样本](tests/fixtures/README.md)，正常 Rust 测试无需 Go。
 
 资源和 buffer 测试覆盖作用域聚合、混合批次与缓存淘汰、共享/Bytes 生命周期、关闭和取消竞态、零长度名额、溢出、封包边界，以及分配失败和 unwind 回滚。队列使用可控时间验证 FIFO、超时和授予/取消交错；Rustdoc 验证 BufferLease、QueuePermit 无法 Clone，SharedBuffer 不可写。
+
+B3 测试包含可控时钟下的任务关停/超时、短写和失败前缀计数、真实 IPv4 回环 TCP 半关闭与 UDP 包边界、超限夹具、分段 codec 输入及指标并发。性能和生产部署仍需后续验证。
 
 [CI 配置](.github/workflows/ci.yml) 在 Linux 和 macOS 上执行格式、Clippy、测试及 release 构建。当前本地验证不等于生产面板、Redis/PostgreSQL 或 Linux 部署联调。
 

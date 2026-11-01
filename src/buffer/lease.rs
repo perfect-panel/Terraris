@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-use std::{fmt, future::poll_fn, io, pin::Pin, sync::Arc, task::Poll};
+use std::{
+    fmt,
+    future::poll_fn,
+    io,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use tokio::io::{AsyncRead, ReadBuf};
 
@@ -205,22 +212,32 @@ impl BufferLease {
         &mut self,
         reader: &mut R,
     ) -> io::Result<usize> {
-        self.check_payload(1)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        poll_fn(|cx| {
-            let mut read =
-                ReadBuf::new(&mut self.owner.storage_mut()[self.end..self.layout.payload_limit()]);
-            match Pin::new(&mut *reader).poll_read(cx, &mut read) {
-                Poll::Pending => Poll::Pending,
-                Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
-                Poll::Ready(Ok(())) => {
-                    let count = read.filled().len();
-                    self.end += count;
-                    Poll::Ready(Ok(count))
-                }
+        poll_fn(|cx| self.poll_payload(cx, |cx, read| Pin::new(&mut *reader).poll_read(cx, read)))
+            .await
+            .map(|(_, count)| count)
+    }
+
+    /// Crate-internal read adapter shared by stream and datagram transports.
+    /// No writable-capacity or arbitrary commit API escapes the buffer layer.
+    pub(crate) fn poll_payload<T>(
+        &mut self,
+        cx: &mut Context<'_>,
+        read: impl FnOnce(&mut Context<'_>, &mut ReadBuf<'_>) -> Poll<io::Result<T>>,
+    ) -> Poll<io::Result<(T, usize)>> {
+        if let Err(error) = self.check_payload(1) {
+            return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidInput, error)));
+        }
+        let mut buffer =
+            ReadBuf::new(&mut self.owner.storage_mut()[self.end..self.layout.payload_limit()]);
+        match read(cx, &mut buffer) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Ready(Ok(value)) => {
+                let count = buffer.filled().len();
+                self.end += count;
+                Poll::Ready(Ok((value, count)))
             }
-        })
-        .await
+        }
     }
 
     fn check_payload(&self, length: usize) -> Result<(), Error> {

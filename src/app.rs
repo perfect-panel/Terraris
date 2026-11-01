@@ -107,6 +107,9 @@ pub async fn run() -> Result<(), Error> {
             println!(
                 "buffers: fixed capacity, shared views, Bytes ownership, bounded cache and byte/message queues"
             );
+            println!(
+                "infrastructure: tracked tasks, monotonic deadlines, budgeted TCP/UDP I/O, bounded codecs, metrics"
+            );
             println!("proxy protocols: none (foundation stage)");
             println!("runtime: not implemented");
         }

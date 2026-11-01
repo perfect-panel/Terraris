@@ -1,6 +1,6 @@
 # Terraris 基础设施设计与实施顺序
 
-状态：B1/B2 已实现，后续阶段待实现。日期：2026-11-01。已完成分级预算、独占/共享 buffer、Bytes 适配、受限缓存及字节/消息双限额队列。下一步进入 task/time、基础 I/O 和协议元数据，再接控制面运行时。
+状态：B1–B3 已实现，控制面运行时待实现。日期：2026-11-01。已完成资源与 buffer、任务与时间管理、网络元数据、TCP/UDP 基础 I/O、codec 和指标。下一阶段进入 scheduler、users、runtimekit 及 Controller/Supervisor。
 
 这些模块通过 Rust 类型和模块组织，不建立一个收集所有工具的 common 包。每个模块要有明确的所有权、资源上限、失败语义和独立验证方法。
 
@@ -62,7 +62,11 @@ flowchart TD
 
 TaskGroup 的关闭流程是停止创建任务、发出取消、等待完成，超过截止时间再终止余下任务并等待回收。取消信号不等于任务已经结束；必须保留任务句柄，才能确认 buffer、socket 和许可已经释放。
 
+当前 TaskGroup 使用 JoinSet，任务上限包括已完成但未回收的结果，拥有者需要显式 join/try_join。shutdown 取消后等待，截止时 abort 余下任务并继续 join；Drop 仅兜底。Tokio 无法抢占阻塞或不让出执行权的 future；任务组不接受 spawn_blocking，也不宣称能硬实时终止这类工作。
+
 超时和租约使用单调时间，状态上报使用 Unix 毫秒。测试使用可控制的时间推进，避免用大量真实 sleep 验证超时。
+
+OperationContext 组合取消域和可选 Deadline，子域不能延长父期限。完成的 I/O 结果不会被返回前的再次停止检查丢弃，保证成功写入可被计量；UnixMillis 单独承担系统时间转换。
 
 错误按所属模块定义，例如资源耗尽、资源已关闭、布局溢出、帧过大、取消、超时和 I/O 失败。基础数据面不使用 `panel::Error` 表达 socket 错误，日志格式化不得携带 buffer 内容、密钥或原始面板响应。
 
@@ -74,13 +78,23 @@ TaskGroup 的关闭流程是停止创建任务、发出取消、等待完成，�
 
 先做直写路径。向量写、收发批处理、延迟合并和平台专有零拷贝在正确性基线及实测数据存在后再引入，且必须使用相同的 buffer 所有权和预算规则。
 
+当前入口：
+
+- [DataPlane](../src/dataplane.rs) 原子预留双向 buffer，用两个本地 future 复制；正常 EOF 只半关闭对应方向，错误取消同一次 relay 的另一方向。
+- [网络 I/O](../src/network/io.rs) 提供显式 SocketAddr TCP 连接和 DatagramEndpoint。UDP 用最大 payload 加一个检测字节拒绝超限/截断包；OS 发送限制独立于配置上界。
+- [地址元数据](../src/network/address.rs) 保留未解析域名、IPv6 scope/flow 信息及网络类型。当前域名接受 ASCII/IDNA ASCII，不隐式 DNS 查询。
+- [Codec](../src/codec/mod.rs) 包含有界基本类型、RFC 1928 目的地址及单帧增量解码器；错误释放部分帧并 poison 状态。
+- [Metrics](../src/telemetry.rs) 提供固定维度计数、RAII gauge 和 Prometheus 文本，无用户/IP 标签。任务结果计数在 join 时更新，原生 panic hook 不由库改写。
+
+TCP 在成功写入返回 n 字节后更新指标，失败结果保留已写前缀；这表示传输接口接受，不等于远端确认。观测计数饱和累加，业务计费由后续 flow/accounting 接入。
+
 ## 6 分批交付
 
 | 顺序 | 交付内容 | 验收重点 |
 | --- | --- | --- |
 | B1 已实现 | resource 分级字节/名额预算、批量预留、BufferLayout、BufferScope 和 BufferLease；无空闲缓存 | 已覆盖上限、并发与关闭、Drop 归还、溢出和分配失败回滚 |
 | B2 已实现 | SharedBuffer、Bytes owner 适配、BufferPool、BufferSender/BufferQueue/QueuePermit | 已覆盖最后引用、混合批次回滚、缓存淘汰、FIFO、授予/取消与关闭交错 |
-| B3 | task/time、network 元数据、TCP/UDP 基础 I/O、codec 和指标 | 双向复制、短写、半关闭、空/大包、截断、慢消费者、任务回收 |
+| B3 已实现 | TaskGroup、OperationContext、地址与 Datagram、DataPlane、codec 和 Metrics | 已覆盖关停/abort 后 join、双向复制、短写、半关闭、空包/超限、慢消费者和分帧回收 |
 | B4 | scheduler、users、runtimekit，再接 Controller/Supervisor | 使用已有预算、任务和 I/O 设施完成事务更新与代次切换 |
 | B5 | SS2022 多用户适配原型及代理闭环 | 用户身份、撤销、限速、设备名额和计量接入统一路径 |
 
@@ -88,7 +102,7 @@ B1 与 B2 的所有权和冻结接口在设计时一起确定；按批实现时�
 
 具体布局、类型、池化和预算算法见 [Buffer 系统设计](buffer.md)。
 
-物理分配仍是同步 try 操作，一个批次属于同一作用域并检查全部祖先；resource 的关闭不主动撤销已授予许可。B2 的异步等待针对队列容量，具有截止时间和等待者上限。共享、缓存及队列已可独立使用；B3 的双向复制和 TaskGroup 尚未接线。
+物理分配仍是同步 try 操作，一个批次属于同一作用域并检查全部祖先；resource 的关闭不主动撤销已授予许可。队列和 I/O 各有截止时间。B1–B3 已可通过 library API 组合，scheduler、用户策略及代理协议运行时仍待 B4/B5 接线。
 
 ## 7 Polaris 参考
 

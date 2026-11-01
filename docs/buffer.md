@@ -1,6 +1,6 @@
 # Terraris Buffer 系统设计
 
-状态：B1/B2 已实现，协议 I/O 集成仍待后续阶段。日期：2026-11-01。当前提供预算许可、独占/共享 buffer、Bytes 适配、受限缓存池、混合批次预留及有界队列。物理分配仍用同步 try 操作；异步等待针对队列额度，并要求截止时间。
+状态：B1/B2 已实现，B3 基础 I/O 已接入预算缓冲，代理协议集成待后续阶段。日期：2026-11-01。当前提供预算许可、独占/共享 buffer、Bytes 适配、受限缓存池、混合批次预留及有界队列。物理分配仍用同步 try 操作；队列和 I/O 各自管理取消及截止时间。
 
 核心决定：缓冲拥有者持有资源许可，池只负责复用已分配存储，队列单独控制消息数和字节数。通过独占可写对象与不可变共享视图区分修改和传递，最后一个拥有者释放后才允许回收。
 
@@ -14,7 +14,7 @@
 
 ## 2 类型与职责
 
-当前公开 API 包含 BufferLayout、BufferLease、BufferScope、SharedBuffer、BufferPool 和队列端口；Allocation/Owner 为内部类型。下表中的 Packet 网络元数据封装留待 B3。
+当前公开 API 包含 BufferLayout、BufferLease、BufferScope、SharedBuffer、BufferPool 和队列端口；Allocation/Owner 为内部类型。B3 用 network::Datagram 承载接收数据报元数据，FlowMetadata 保留未解析目标。
 
 | 类型 | 所有权和职责 | 约束 |
 | --- | --- | --- |
@@ -24,7 +24,7 @@
 | `SharedBuffer` | 冻结后的拥有者和只读范围 | 切片/Clone 共享分配，不能原地修改 |
 | `BufferPool` | 按尺寸类别缓存 Allocation，管理闲置容量 | 不是无界全局缓存，不持有用户对象 |
 | `BufferScope` | 连接/子流的预算身份 | 最后保留视图消失前，用量不能归零 |
-| `Packet` | 网络元数据及一个 buffer | 明确包边界，与存储生命周期分开 |
+| `network::Datagram` | 来源、绑定本地地址及 SharedBuffer | 包边界明确；通配绑定不表示具体目的 IP |
 | `BufferSender` / `BufferQueue` / `QueuePermit` | MPSC 发送、接收、字节/消息双维度许可 | 入队项继续持有分配与作用域许可 |
 
 Allocation 采用固定长度、已初始化的 `Box<[u8]>`，由安全的 fallible Vec 预留及初始化构造。独占状态不为每块 payload 再包一层 Arc；第一次冻结时才创建共享拥有者，视图记录范围。
@@ -178,11 +178,13 @@ TCP 复制循环保留已读长度和已写偏移。短写只推进实际写入�
 
 [Tokio copy_bidirectional](https://docs.rs/tokio/latest/tokio/io/fn.copy_bidirectional.html)可作为双向复制及半关闭的正确性对照。它使用内部 buffer，不能仅套用它后就声称复制内存已进入 Terraris 池；生产适配须明确使用受预算控制的存储。
 
+B3 DataPlane 已使用 BufferScope 原子预留两块缓冲，保留短写偏移，按成功写入调用 Metrics 和可选 TransferObserver。两个方向共享空闲时钟；错误停止同一次 relay 的另一方向，正常 EOF 则 flush/半关闭。DatagramEndpoint 复用 buffer 内部 ReadBuf 入口，不暴露任意 set_len，以最大 payload 加一个检测字节识别超限。
+
 UDP 发送提交完整数据报或返回失败，截断接收明确丢弃或报错；合法的零长度数据报不是 EOF。批处理逐项记录成功并释放失败/未发送项。对需要保留 buffer 的异步库，完成条件要符合其所有权契约，不能在完成回调前回收。
 
 ## 10 观测和验证
 
-B2 已提供 Budget 的 reserved/resident 快照，PoolSnapshot 的 idle/pending/leased 容量与名额、命中/未命中、淘汰和预算拒绝次数，以及 QueueSnapshot 的 queued/reserved、等待者、发送端和关闭状态。跨层快照不是跨锁事务。复制字节、丢包和等待时长的聚合指标留给后续 telemetry 集成，不记录 payload 或用户标识。
+已提供 Budget 的 reserved/resident、PoolSnapshot 的容量与命中/淘汰、QueueSnapshot 的排队/预留与等待者，以及 B3 Metrics 的任务、TCP 写入、UDP 成功/超限、取消/超时和 codec 计数。跨层快照不是事务；等待时长分布与吞吐基准留给性能工作，不记录 payload 或用户标识。
 
 关键用例：
 
