@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 async-trait = "0.1"
 bytes = "1.12.1"
+futures-util = "0.3.34"
 clap = { version = "4.5", features = ["derive"] }
 prost = "0.14.4"
 prost-types = "0.14.4"

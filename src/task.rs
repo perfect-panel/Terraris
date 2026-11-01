@@ -177,6 +177,20 @@ impl TaskGroup {
         let result = self.tasks.try_join_next_with_id()?;
         Some(self.report(result))
     }
+    pub fn abort_all(&mut self) {
+        self.cancel();
+        self.tasks.abort_all();
+    }
+    /// Lets an owning coordinator poll under a short mutex without holding it
+    /// across await. Handles remain in this group if the waiter is cancelled.
+    pub fn poll_join_next(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<TaskReport>> {
+        self.tasks
+            .poll_join_next_with_id(cx)
+            .map(|result| result.map(|result| self.report(result)))
+    }
 
     /// Cancel, wait until the deadline, then abort and JOIN every remaining task.
     /// Tokio cannot preempt a blocking/non-yielding future; this API deliberately

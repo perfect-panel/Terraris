@@ -111,7 +111,9 @@ pub async fn run() -> Result<(), Error> {
                 "infrastructure: tracked tasks, monotonic deadlines, budgeted TCP/UDP I/O, bounded codecs, metrics"
             );
             println!("proxy protocols: none (foundation stage)");
-            println!("runtime: not implemented");
+            println!(
+                "runtime: library scheduler, transactional users, controller/supervisor and runtimekit; no proxy driver or run command"
+            );
         }
         Command::Check {
             config: path,

@@ -2,12 +2,13 @@
 
 Terraris 是参考 Polaris 架构设计的 PPanel Rust 节点端项目，负责代理协议接入、用户认证、限速与设备准入，以及节点状态、在线设备和流量上报。
 
-当前已完成 Rust 基础工程、PPanel 面板客户端，以及 B1–B3 的 buffer、任务、时间、网络 I/O、codec 和指标模块。代理协议、Supervisor/Controller、限速执行及持久化上报尚未实现；二进制仍用于配置与只读检查，基础设施通过 library API 使用，不自动启动代理或指标监听器。
+当前已完成 Rust 基础工程、PPanel 面板客户端、B1–B3 基础设施，以及 B4 的 scheduler、用户事务更新、runtimekit 和 Controller/Supervisor。代理协议、限速/设备执行器及持久化上报尚未实现；二进制仍用于配置与只读检查，控制面通过 library API 装配真实驱动后使用。
 
 - [架构设计](docs/architecture.md)：模块边界、状态管理、协议规划、故障处理与实施阶段。
 - [PPanel 接口契约](docs/ppanel-api.md)：当前 backend 的实际接口、身份与计量语义、兼容性要求。
 - [基础设施顺序](docs/infrastructure.md)：先完成资源、任务、buffer 和基础 I/O，再接控制面运行时。
 - [Buffer 系统设计](docs/buffer.md)：所有权、前后预留空间、共享切片、内存预算、池化和背压。
+- [B4 控制面与运行时](docs/control-plane.md)：事务提交、准入、代次切换、维护调度、报告与退出。
 
 设计沿用 Polaris 的 `panel → supervisor/controller → protocol` 分层，以 `runtimekit` 统一运行时生命周期、以 `flow` 统一数据面策略。采用单进程、多协议结构，优先面向 Linux x86_64 和 aarch64。Rust 负责节点控制与协议集成；候选协议库必须能接入统一的用户策略、连接管理和流量计量。
 
@@ -25,6 +26,10 @@ Terraris 是参考 Polaris 架构设计的 PPanel Rust 节点端项目，负责�
 - task/time 提供有上限的任务组、取消传播、等待与 abort 后回收、单调截止时间和独立的 Unix 毫秒类型。
 - network/dataplane 提供未解析地址元数据、TCP 连接与有预算的双向转发、UDP 收发和超限检测；codec 提供有界基本类型/地址读写及增量长度帧。
 - telemetry 提供固定维度原子计数、RAII 活动指标、快照和 Prometheus 文本，不保存用户地址或 payload 标签。
+
+- scheduler/users/runtimekit 提供有界维护调度、用户版本 CAS、会话撤销信号、准入门、任务和排空生命周期。
+- Controller/Supervisor 提供配置与用户同步、候选回滚、跨代次共享状态、退役清理、可选主机状态采样与指纹发布。
+- Reports 提供有上限的内存流量/在线状态、批次确认和最终冲刷；进程重启不保留，面板 ACK 丢失仍有重复计费风险。
 
 设备租约、用户限制和流量接口目前由 library 暴露；这不代表已经有数据面执行这些策略。
 
@@ -80,6 +85,14 @@ UDP 的 local_addr 是绑定地址，通配绑定时不表示具体目的 IP。6
 
 FrameDecoder 的 consumed 指明本次消费量，剩余输入由调用方保留。解码失败要求关闭流，或只在已知帧边界 reset，不能盲目重试。这些长度帧与地址组件不表示已实现 SOCKS 或其他代理协议。Rustdoc 提供可执行用法示例。
 
+## B4 控制面与运行时
+
+`Supervisor` 接收面板连接、真实协议 factory、进程 `BufferScope`、容量选项、指标、指纹 sink 与可选状态 sampler。`sync_config` 发布成功后启动代次维护；`run` 继续驱动配置、退役与报告，取消后执行关闭。单次同步的宿主需显式 `reap_retired` 和 `close`。
+
+候选认证和监听器全部提交成功前，准入始终关闭。共享用户快照、报告和配置验证器在同一发布事务中切换；失败保留活跃代次，旧响应通过 revision/代次检查拒绝。旧会话继续看到当前限制和撤销。默认用户快照 15 分钟未确认后暂停，401/403 立即暂停。
+
+协议驱动必须为每个连接或子流取得 `Core::admit` 许可，并将其 context 用于后续 I/O；所有异步任务交给 Core。关闭依次停止接入、限时排空、取消和 join，退役重试不延长原截止时间。当前只用测试驱动验证这些约定，没有生产协议或监听器实现。完整上限、接入契约与边界见 [B4 文档](docs/control-plane.md)。
+
 ## 构建与本地检查
 
 工具链固定在 `rust-toolchain.toml`，依赖固定在 `Cargo.lock`。需要 Rust 1.97.1 及平台 C 构建工具供 TLS 密码依赖使用；protoc 随构建依赖提供，无需单独安装，也不依赖旁边的 backend 仓库。
@@ -132,7 +145,7 @@ cargo build --locked --release
 
 资源和 buffer 测试覆盖作用域聚合、混合批次与缓存淘汰、共享/Bytes 生命周期、关闭和取消竞态、零长度名额、溢出、封包边界，以及分配失败和 unwind 回滚。队列使用可控时间验证 FIFO、超时和授予/取消交错；Rustdoc 验证 BufferLease、QueuePermit 无法 Clone，SharedBuffer 不可写。
 
-B3 测试包含可控时钟下的任务关停/超时、短写和失败前缀计数、真实 IPv4 回环 TCP 半关闭与 UDP 包边界、超限夹具、分段 codec 输入及指标并发。性能和生产部署仍需后续验证。
+B3 测试包含可控时钟下的任务关停/超时、短写和失败前缀计数、真实 IPv4 回环 TCP 半关闭与 UDP 包边界、超限夹具、分段 codec 输入及指标并发。B4 增加多协议提交回滚、旧响应/用户更新竞争、跨代次会话、调度、报告 ACK 和关闭测试。性能和生产部署仍需后续验证。
 
 [CI 配置](.github/workflows/ci.yml) 在 Linux 和 macOS 上执行格式、Clippy、测试及 release 构建。当前本地验证不等于生产面板、Redis/PostgreSQL 或 Linux 部署联调。
 

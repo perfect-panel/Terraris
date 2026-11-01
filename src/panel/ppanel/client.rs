@@ -614,3 +614,9 @@ impl StatusClient for ProtocolPort {
 fn encode_json(endpoint: Endpoint, value: &serde_json::Value) -> Result<Vec<u8>> {
     serde_json::to_vec(value).map_err(|_| Error::input(endpoint, "request cannot be encoded"))
 }
+
+impl crate::supervisor::FingerprintSink for CertificateFingerprints {
+    fn replace(&self, values: BTreeMap<ProtocolName, CertificateFingerprint>) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = values;
+    }
+}

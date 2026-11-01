@@ -1,6 +1,6 @@
 # Terraris 基础设施设计与实施顺序
 
-状态：B1–B3 已实现，控制面运行时待实现。日期：2026-11-01。已完成资源与 buffer、任务与时间管理、网络元数据、TCP/UDP 基础 I/O、codec 和指标。下一阶段进入 scheduler、users、runtimekit 及 Controller/Supervisor。
+状态：B1–B4 已实现。日期：2026-11-01。资源、buffer、任务、时间、网络 I/O、codec、指标和控制面 library 已完成；B4 细节见[控制面与运行时](control-plane.md)。下一阶段 B5 接入 SS2022 与统一 flow。
 
 这些模块通过 Rust 类型和模块组织，不建立一个收集所有工具的 common 包。每个模块要有明确的所有权、资源上限、失败语义和独立验证方法。
 
@@ -95,14 +95,14 @@ TCP 在成功写入返回 n 字节后更新指标，失败结果保留已写前�
 | B1 已实现 | resource 分级字节/名额预算、批量预留、BufferLayout、BufferScope 和 BufferLease；无空闲缓存 | 已覆盖上限、并发与关闭、Drop 归还、溢出和分配失败回滚 |
 | B2 已实现 | SharedBuffer、Bytes owner 适配、BufferPool、BufferSender/BufferQueue/QueuePermit | 已覆盖最后引用、混合批次回滚、缓存淘汰、FIFO、授予/取消与关闭交错 |
 | B3 已实现 | TaskGroup、OperationContext、地址与 Datagram、DataPlane、codec 和 Metrics | 已覆盖关停/abort 后 join、双向复制、短写、半关闭、空包/超限、慢消费者和分帧回收 |
-| B4 | scheduler、users、runtimekit，再接 Controller/Supervisor | 使用已有预算、任务和 I/O 设施完成事务更新与代次切换 |
+| B4 已实现 | scheduler、users、runtimekit、Controller/Supervisor 与内存报告状态 | 已覆盖事务失败回滚、代次/用户版本竞争、撤销、调度与退役回收；使用模拟协议驱动 |
 | B5 | SS2022 多用户适配原型及代理闭环 | 用户身份、撤销、限速、设备名额和计量接入统一路径 |
 
 B1 与 B2 的所有权和冻结接口在设计时一起确定；按批实现时不开放随后会绕过预算的临时裸 Vec API。协议库的只读接口评估可以提前做，数据面集成以基建契约稳定为前提。
 
 具体布局、类型、池化和预算算法见 [Buffer 系统设计](buffer.md)。
 
-物理分配仍是同步 try 操作，一个批次属于同一作用域并检查全部祖先；resource 的关闭不主动撤销已授予许可。队列和 I/O 各有截止时间。B1–B3 已可通过 library API 组合，scheduler、用户策略及代理协议运行时仍待 B4/B5 接线。
+物理分配仍是同步 try 操作，一个批次属于同一作用域并检查全部祖先；resource 的关闭不主动撤销已授予许可。队列和 I/O 各有截止时间。B1–B4 已可通过 library API 组合；B5 仍需真实协议、flow、限速和设备租约执行器。
 
 ## 7 Polaris 参考
 

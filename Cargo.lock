@@ -1690,6 +1690,7 @@ dependencies = [
  "axum",
  "bytes",
  "clap",
+ "futures-util",
  "prost",
  "prost-build",
  "prost-types",

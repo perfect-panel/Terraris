@@ -1,6 +1,6 @@
 # Terraris 架构设计
 
-状态：架构基线。日期：2026-11-01。Rust 基础工程、PPanel 接口及 B1–B3 的资源、buffer、任务、时间、网络 I/O、codec 和指标已实现，当前能力见 [README](../README.md)。后续进入 scheduler、users、runtimekit 和控制面运行时；协议、更新生命周期和运维默认值仍是后续方案，不代表已经部署验证。
+状态：架构基线。日期：2026-11-01。Rust 基础工程、PPanel 接口及 B1–B4 基础设施和控制面 library 已实现，当前能力见 [README](../README.md) 与 [B4 文档](control-plane.md)。更新生命周期已用模拟驱动验证；真实协议、flow、限速、设备执行器和生产运维仍在后续阶段。
 
 Terraris 以 Polaris 的实际模块和生命周期为架构基线：`panel` 隔离面板协议，`supervisor` 管服务器配置代次，`controller` 管单协议用户与维护任务，`protocol::runtimekit` 统一运行时装配，`protocol::flow` 统一数据面策略。通过 Rust 的所有权、类型和异步任务模型实现这些边界。
 
@@ -49,7 +49,7 @@ TCP 字节流和 UDP 数据报分别建模。QUIC 流可以交付字节流接口
 
 初期使用一个 Cargo package，包含二进制入口和可测试的内部模块，模块命名与 Polaris 对齐。现成 Rust 协议引擎以依赖引入；需要自研且可独立复用的引擎再单独拆 crate。crate 数量不决定架构分层，跨模块依赖规则从第一版生效。
 
-以下是目标模块划分；当前已实现 `app`、`config`、`panel` 及 B1–B3 基础设施。scheduler、用户策略和协议运行时按后续阶段引入，不建立空实现：
+以下是目标模块划分；当前已实现 `app`、`config`、`panel` 及 B1–B4 基础设施和控制面。真实协议、flow、限速与设备执行器在 B5 引入；runtime factory 当前没有生产协议实现：
 
 | 拟定 Rust 模块 | 职责 | Polaris 对应位置 |
 | --- | --- | --- |
@@ -346,12 +346,12 @@ check、capabilities 和 version 已实现；run 随服务运行时阶段加入�
 | M0 架构设计 | Polaris 架构映射与 PPanel 接口契约 | 已完成模块、端口和状态所有权设计 |
 | M1a 基础工程与面板接口 | Rust 工程、PanelConnection、完整 PPanel 客户端、只读检查 CLI | 已通过本地 JSON/Protobuf 契约测试及 Go 编码样本互操作；真实部署联调待完成 |
 | M1b 基础设施与 Buffer | resource、buffer、task/time、network/codec、基础 dataplane 与指标 | B1–B3 已完成，已验证预算、回收、双向复制、数据报和 codec；性能及生产部署仍待验证 |
-| M1c 控制面与协议可行性 | scheduler、users、Supervisor/Controller、RuntimeKit、模拟运行时和 SS2022 适配原型 | 复用 M1b；候选失败不开放代次准入、不推进验证器；协议多用户与热更新接口可用 |
+| M1c 控制面与协议可行性 | scheduler、users、Supervisor/Controller、RuntimeKit、模拟运行时和 SS2022 适配原型 | B4 控制面已完成模拟验证；B5 的 SS2022 多用户、真实监听器及热更新适配仍待实现 |
 | M2 首个代理闭环 | SS2022 TCP/UDP、用户快照、流处理、限速与设备准入 | 真实兼容客户端互通；用户撤销取消在途拨号；跨节点竞争同一设备名额不超限 |
 | M3 生产运行基础 | 持久化上报、更新恢复、退出与服务包装 | 响应丢失、重启恢复、存储失败、证书替换、长期离线、负载与资源限额测试 |
 | M4 协议扩展 | 按能力矩阵逐项增加协议 | 每个协议沿用 M2/M3 的策略与故障测试，增加独立互通用例 |
 
-当前测试覆盖面板接口、HTTP/CLI，以及 B1–B3 的预算、所有权、任务回收、I/O 与 codec。后续阶段至少覆盖以下具有业务意义的场景：
+当前测试覆盖面板接口、HTTP/CLI，B1–B3 基础设施，以及 B4 的候选回滚、版本竞争、代次切换、调度、报告和关闭。以下是全阶段验收要求；B4 的模拟验证仍需在真实协议与部署上补充：
 
 - buffer 和队列预算不超限，共享视图不提前回池，取消/关闭并发恰好回收一次；重载不重置总预算。
 - 同一订阅多连接和双向流量共享速率；增加连接不会突破总限制。

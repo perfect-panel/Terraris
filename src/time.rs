@@ -5,8 +5,13 @@
 use std::{
     fmt,
     future::Future,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use tokio::sync::Notify;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -15,6 +20,7 @@ pub enum Error {
     DeadlineOverflow,
     BeforeUnixEpoch,
     TimestampOverflow,
+    AlreadyConstrained,
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -22,6 +28,7 @@ impl fmt::Display for Error {
             Self::DeadlineOverflow => "deadline overflows monotonic clock",
             Self::BeforeUnixEpoch => "wall clock precedes Unix epoch",
             Self::TimestampOverflow => "Unix millisecond timestamp overflows i64",
+            Self::AlreadyConstrained => "operation already has another revocation constraint",
         })
     }
 }
@@ -103,12 +110,14 @@ impl std::error::Error for StopReason {}
 pub struct OperationContext {
     cancellation: CancellationToken,
     deadline: Option<Deadline>,
+    revocation: Option<Revocation>,
 }
 impl OperationContext {
     pub fn new(cancellation: CancellationToken, deadline: Option<Deadline>) -> Self {
         Self {
             cancellation,
             deadline,
+            revocation: None,
         }
     }
     pub fn cancellation(&self) -> &CancellationToken {
@@ -118,20 +127,38 @@ impl OperationContext {
         self.deadline
     }
     pub fn child(&self) -> Self {
-        Self::new(self.cancellation.child_token(), self.deadline)
+        Self {
+            cancellation: self.cancellation.child_token(),
+            deadline: self.deadline,
+            revocation: self.revocation.clone(),
+        }
     }
     /// A child may shorten, but never extend, its parent's deadline.
     pub fn child_with_deadline(&self, deadline: Deadline) -> Self {
-        Self::new(
-            self.cancellation.child_token(),
-            Some(
+        Self {
+            cancellation: self.cancellation.child_token(),
+            deadline: Some(
                 self.deadline
                     .map_or(deadline, |parent| parent.min(deadline)),
             ),
-        )
+            revocation: self.revocation.clone(),
+        }
+    }
+    pub fn with_revocation(mut self, revocation: Revocation) -> Result<Self, Error> {
+        if self
+            .revocation
+            .as_ref()
+            .is_some_and(|old| !Arc::ptr_eq(&old.inner, &revocation.inner))
+        {
+            return Err(Error::AlreadyConstrained);
+        }
+        self.revocation = Some(revocation);
+        Ok(self)
     }
     pub fn check(&self) -> Result<(), StopReason> {
-        if self.cancellation.is_cancelled() {
+        if self.cancellation.is_cancelled()
+            || self.revocation.as_ref().is_some_and(Revocation::is_revoked)
+        {
             Err(StopReason::Cancelled)
         } else if self.deadline.is_some_and(Deadline::is_elapsed) {
             Err(StopReason::DeadlineExceeded)
@@ -147,6 +174,7 @@ impl OperationContext {
         tokio::select! {
             biased;
             _=self.cancellation.cancelled()=>Err(StopReason::Cancelled),
+            _=self.wait_revocation()=>Err(StopReason::Cancelled),
             _=self.wait_deadline()=>Err(StopReason::DeadlineExceeded),
             value=future=>Ok(value),
         }
@@ -157,5 +185,57 @@ impl OperationContext {
         } else {
             std::future::pending::<()>().await;
         }
+    }
+    async fn wait_revocation(&self) {
+        if let Some(signal) = &self.revocation {
+            signal.revoked().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// A monotonic revocation flag whose publication and wakeup can be separated.
+/// Committers mark under their publication lock, then wake after unlocking.
+#[derive(Clone, Default)]
+pub struct Revocation {
+    inner: Arc<RevocationInner>,
+}
+#[derive(Default)]
+struct RevocationInner {
+    revoked: AtomicBool,
+    notify: Notify,
+}
+impl Revocation {
+    pub fn is_revoked(&self) -> bool {
+        self.inner.revoked.load(Ordering::Acquire)
+    }
+    pub fn revoke(&self) {
+        self.mark();
+        self.notify();
+    }
+    pub(crate) fn mark(&self) {
+        self.inner.revoked.store(true, Ordering::Release);
+    }
+    pub(crate) fn notify(&self) {
+        self.inner.notify.notify_waiters();
+    }
+    pub async fn revoked(&self) {
+        loop {
+            let notified = self.inner.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_revoked() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+impl fmt::Debug for Revocation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Revocation")
+            .field("revoked", &self.is_revoked())
+            .finish()
     }
 }
