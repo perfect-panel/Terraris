@@ -17,7 +17,7 @@
 | 重载 | 同端口共享 accept loop，候选失败保留活跃路由，旧连接限时排空；相同 Encryption 配置保留票据缓存 |
 | 出站 | 共享路由引擎、分域 DNS/缓存/DoH/DoT、直连/阻断/DNS/SOCKS5/HTTP/VLESS；见 [路由文档](routing-dns.md) |
 
-当前入站载体为 TCP/raw，可使用 rustls/aws-lc-rs TLS 和 UoT，配置见 [TLS 与 UoT](tls-protocols.md)。REALITY、Vision、XHTTP、WebSocket/gRPC 等组合没有实现；相关非默认字段会拒绝，不能仅凭 VLESS 名称认为所有组合均可用。VLESS 用户凭据须是可解析的 UUID，等价 UUID 编码冲突会拒绝整个用户快照。
+当前入站载体为 TCP/raw、WebSocket、gRPC、HTTP Upgrade 和 [XHTTP](xhttp.md)，可使用 rustls/aws-lc-rs TLS 和 UoT，配置见 [TLS 与 UoT](tls-protocols.md)。传输配置见 [流传输文档](stream-transports.md)。REALITY、Vision 等组合没有实现；相关非默认字段会拒绝，不能仅凭 VLESS 名称认为所有组合均可用。VLESS 用户凭据须是可解析的 UUID，等价 UUID 编码冲突会拒绝整个用户快照。
 
 XUDP 的 UDP socket 由进程级会话表持有，承载连接只持有当前接管许可。非零 GlobalID 可在保留期内迁移到新的承载连接，复用同一地址族的 UDP socket，保持出口端口；零 GlobalID 或缺失 GlobalID 使用连接内会话。普通 VLESS UDP 仍只接受指定目标的回复。
 

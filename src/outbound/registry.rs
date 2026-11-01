@@ -15,6 +15,14 @@ use std::sync::Arc;
 
 #[async_trait]
 pub trait Connector: Send + Sync {
+    fn abort(&self) {}
+    fn idle(&self) -> bool {
+        true
+    }
+    async fn close(&self, _context: &OperationContext) -> Result<(), Error> {
+        self.abort();
+        Ok(())
+    }
     fn supports(&self, network: Network) -> bool;
     async fn connect(
         &self,
@@ -52,7 +60,7 @@ pub struct Context {
 }
 pub trait Factory: Send + Sync {
     fn kind(&self) -> Kind;
-    /// Pure compilation only; network tasks belong to individual connections.
+    /// Pure compilation only; connection pools must own and close their tasks.
     /// Proxy providers must return a connector, builtin actions must return None.
     fn compile(
         &self,
@@ -184,6 +192,15 @@ impl Factory for ProxyFactory {
 }
 #[async_trait]
 impl Connector for Proxy {
+    fn abort(&self) {
+        self.transport.abort();
+    }
+    fn idle(&self) -> bool {
+        self.transport.idle()
+    }
+    async fn close(&self, context: &OperationContext) -> Result<(), Error> {
+        self.transport.close(context).await.map_err(Error::from)
+    }
     fn supports(&self, network: Network) -> bool {
         network == Network::Tcp || self.uot.is_some() || self.kind != super::Kind::Http
     }

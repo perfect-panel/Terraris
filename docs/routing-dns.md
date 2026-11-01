@@ -62,7 +62,7 @@ DNSSEC 标志可以转发，但当前不进行本地 DNSSEC 验证。没有 DoQ�
 
 SOCKS5 UDP 仅接收已连接中继的报文；未指定的中继地址绑定到实际 TCP 代理对端。控制连接结束即结束关联。不支持 SOCKS UDP 分片。XUDP 部分写入被取消后会关闭该载体，防止下一条报文接在半帧之后。
 
-代理出站不含 SOCKS4、Shadowsocks、VMess、Trojan、AnyTLS，也不含 REALITY、Vision、uTLS 指纹、WebSocket、gRPC、XHTTP 或外层多路复用。相关字段不会被静默忽略。SOCKS5/HTTP/VLESS 出站的 UoT 配置见 [TLS 与 UoT](tls-protocols.md)。
+代理出站不含 SOCKS4、Shadowsocks、VMess、Trojan、AnyTLS，也不含 REALITY、Vision、uTLS 指纹或额外的协议多路复用。代理出站已支持 [XHTTP](xhttp.md)、WebSocket、gRPC、HTTP Upgrade，见 [流传输文档](stream-transports.md)。相关字段不会被静默忽略。SOCKS5/HTTP/VLESS 出站的 UoT 配置见 [TLS 与 UoT](tls-protocols.md)。
 
 ## 配置与重载
 

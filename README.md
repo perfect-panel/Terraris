@@ -2,7 +2,7 @@
 
 Terraris 是参考 Polaris 架构设计的 PPanel Rust 节点端项目，负责代理协议接入、用户认证、限速与设备准入，以及节点状态、在线设备和流量上报。
 
-当前已完成 B1–B4 基础设施与控制面、B5 的 VLESS TCP、UDP/XUDP 和 VLESS Encryption 接入，以及 Trojan、AnyTLS、TLS 入站、UoT、共享路由、DNS 和 SOCKS5/HTTP/VLESS 出站。`terraris run` 可运行实际 Rust 节点，包含用户撤销、共享限速、设备租约与计量。已通过本机 Xray 和官方 AnyTLS 客户端互通；持久化上报、其他传输/协议及生产部署验证仍待完成。
+当前已完成 B1–B4 基础设施与控制面、B5 的 VLESS TCP、UDP/XUDP 和 VLESS Encryption 接入，以及 Trojan、AnyTLS、TLS 入站、WebSocket/gRPC/HTTP Upgrade/XHTTP（HTTP/1.1/2/3）、UoT、共享路由、DNS 和 SOCKS5/HTTP/VLESS 出站。`terraris run` 可运行实际 Rust 节点，包含用户撤销、共享限速、设备租约与计量。已通过本机 Xray、Polaris XHTTP 和官方 AnyTLS 客户端互通；持久化上报、其他传输/协议及生产部署验证仍待完成。
 
 - [架构设计](docs/architecture.md)：模块边界、状态管理、协议规划、故障处理与实施阶段。
 - [PPanel 接口契约](docs/ppanel-api.md)：当前 backend 的实际接口、身份与计量语义、兼容性要求。
@@ -11,6 +11,8 @@ Terraris 是参考 Polaris 架构设计的 PPanel Rust 节点端项目，负责�
 - [B4 控制面与运行时](docs/control-plane.md)：事务提交、准入、代次切换、维护调度、报告与退出。
 - [B5 VLESS 接入](docs/vless.md)：当前协议组合、Encryption 参数、运行方式和 Xray 互通复现。
 - [TLS、Trojan、AnyTLS 与 UoT](docs/tls-protocols.md)：本地 PEM、证书热重载、多流、UDP 和客户端互通。
+- [WebSocket、gRPC 与 HTTP Upgrade](docs/stream-transports.md)：配置、多流、连接复用、早期数据和 Xray 双向互通。
+- [XHTTP / SplitHTTP](docs/xhttp.md)：HTTP/1.1/2/3、三种模式、XMUX、上下行分离和 Polaris 双向互通。
 - [协议与传输注册表](docs/registries.md)：工厂扩展、别名、内置实现与热重载生命周期。
 - [路由、DNS 与代理出站](docs/routing-dns.md)：规则语义、GeoData、解析缓存、DoH/DoT、重载与验证。
 
@@ -40,7 +42,7 @@ Terraris 是参考 Polaris 架构设计的 PPanel Rust 节点端项目，负责�
 - Trojan 支持 TLS/TCP 和 UDP；AnyTLS 支持 v1/v2 多流会话及 UoT。TLS 使用 rustls/aws-lc-rs，支持本地 PEM 校验、指纹上报和事务热重载。
 - 同端口候选共享 accept loop，失败更新保留活跃服务；相同加密设置的重载保留恢复票据。
 
-当前入站载体为 TCP/raw，可组合标准 TLS；REALITY、Vision 等组合会拒绝。代理出站支持标准 TLS 和可选 UoT。非零 GlobalID 现可跨承载连接及兼容配置代次迁移，保留 UDP 出口 socket；恢复仍需用户和设备准入。完整能力边界见 [VLESS 文档](docs/vless.md)。
+当前入站载体支持 TCP/raw、WebSocket、gRPC、HTTP Upgrade 和 XHTTP，可组合标准 TLS；REALITY、Vision 等组合会拒绝。代理出站也可使用上述传输、标准 TLS 和可选 UoT。非零 GlobalID 现可跨承载连接及兼容配置代次迁移，保留 UDP 出口 socket；恢复仍需用户和设备准入。完整能力边界见 [VLESS 文档](docs/vless.md)。
 
 ## DNS、限速和路由现状
 

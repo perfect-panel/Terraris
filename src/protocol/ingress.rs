@@ -17,7 +17,7 @@ use tokio::sync::Mutex as AsyncMutex;
 pub(crate) trait Acceptor: Send + Sync {
     fn closed(&self) -> bool;
     fn accepting(&self) -> bool;
-    fn accept(self: Arc<Self>, stream: crate::network::Stream, source: SocketAddr);
+    fn accept(self: Arc<Self>, stream: crate::transport::Accepted, source: SocketAddr);
 }
 #[derive(Default)]
 pub(crate) struct Registry {
@@ -61,10 +61,10 @@ impl Registry {
         let weak = Arc::downgrade(&binding);
         binding.tasks.lock().await.spawn("protocol.accept",move|cancel|async move{
             let context = OperationContext::new(cancel.clone(), None);
-            loop{let accepted=tokio::select!{biased;_=cancel.cancelled()=>break,result=listener.accept(&context)=>result};let(socket,source)=match accepted{Ok(v)=>v,Err(_)=>{tokio::time::sleep(std::time::Duration::from_millis(10)).await;continue;}};
+            loop{let accepted=tokio::select!{biased;_=cancel.cancelled()=>break,result=listener.accept_carrier(&context)=>result};let(socket,source)=match accepted{Ok(v)=>v,Err(_)=>{tokio::time::sleep(std::time::Duration::from_millis(10)).await;continue;}};
                 let Some(binding)=weak.upgrade()else{break;};let driver=binding.candidates().into_iter().find(|driver|driver.accepting());drop(binding);
                 if let Some(driver)=driver{driver.accept(socket,source);} // Otherwise the unready socket is dropped.
-            }Ok(())
+            }listener.close().await;Ok(())
         }).map_err(Error::Task)?;
         bindings.insert(address, Arc::downgrade(&binding));
         Ok(binding)
@@ -123,4 +123,62 @@ impl Drop for Ingress {
         self.cancel.cancel();
         self.tasks.get_mut().abort_all();
     }
+}
+
+/// Own all logical-stream futures alongside the multiplexed transport driver.
+/// Dropping this future drops HTTP/2, every stream and all their buffer leases.
+pub(crate) async fn multiplex<F>(
+    mut carrier: Box<dyn crate::transport::Multiplexed>,
+    core: crate::protocol::runtimekit::Core,
+    cancel: CancellationToken,
+    handshake_timeout: std::time::Duration,
+    idle_timeout: std::time::Duration,
+    mut handle: F,
+) -> Result<(), crate::task::TaskFailure>
+where
+    F: FnMut(
+            crate::network::Stream,
+            CancellationToken,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send,
+{
+    use futures_util::{StreamExt, stream::FuturesUnordered};
+    let mut jobs = FuturesUnordered::new();
+    let mut retirement = tokio::time::interval(std::time::Duration::from_secs(1));
+    let mut draining = false;
+    let mut had_stream = false;
+    let mut last = tokio::time::Instant::now();
+    let result = async {
+    loop {
+        if draining && jobs.is_empty() && !carrier.busy() {
+            // Give GOAWAY a chance to flush before releasing an empty carrier.
+            std::future::poll_fn(|cx| {
+                let _ = carrier.poll_accept(cx);
+                std::task::Poll::Ready(())
+            })
+            .await;
+            return Ok(());
+        }
+        tokio::select! {
+            biased;
+            _=cancel.cancelled()=>return Err(crate::task::TaskFailure::Cancelled),
+            _=retirement.tick()=>{
+                if !core.is_current() && !draining {draining=true;carrier.drain();}
+            }
+            _=tokio::time::sleep_until(last+if had_stream{idle_timeout}else{handshake_timeout}),if jobs.is_empty() && !carrier.busy()=>{
+                if carrier.last_activity().is_some_and(|activity|activity>last){last=carrier.last_activity().unwrap();}else{return Ok(());}
+            },
+            _=jobs.next(),if !jobs.is_empty()=>{last=tokio::time::Instant::now();}
+            stream=std::future::poll_fn(|cx|carrier.poll_accept(cx))=>{
+                let Some(stream)=stream.map_err(|_|crate::task::TaskFailure::Failed("multiplexed transport"))? else{return Ok(());};
+                if draining || !core.is_current() || jobs.len()>=crate::transport::MAX_MULTIPLEX_STREAMS {drop(stream);continue;}
+                had_stream=true;last=tokio::time::Instant::now();
+                jobs.push(handle(stream,cancel.child_token()));
+            }
+        }
+    }
+    }.await;
+    drop(jobs);
+    carrier.close().await;
+    result
 }

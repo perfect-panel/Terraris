@@ -8,6 +8,17 @@ license = "GPL-3.0-only"
 publish = false
 
 [dependencies]
+hyper = { version = "1.12", features = ["http1", "http2", "client", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "client"] }
+http-body = "1"
+http-body-util = "0.1"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
+h2 = "0.4.20"
+http = "1"
+httparse = "1.10"
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
 hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
 ipnet = "2.12"
 regex = "1.13"
@@ -29,7 +40,7 @@ x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
 zeroize = { version = "1", features = ["derive"] }
 async-trait = "0.1"
 bytes = "1.12.1"
-futures-util = "0.3.34"
+futures-util = { version = "0.3.34", features = ["sink"] }
 clap = { version = "4.5", features = ["derive"] }
 prost = "0.14.4"
 prost-types = "0.14.4"

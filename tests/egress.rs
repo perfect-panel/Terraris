@@ -852,7 +852,7 @@ async fn builtin_http_proxy_uses_registered_outbound_transport() {
 #[tokio::test]
 async fn transport_rejects_unknown_tls_and_unused_options_without_fallback() {
     for extra in [
-        json!({"transport":"ws"}),
+        json!({"transport":"quic"}),
         json!({"security":"reality"}),
         json!({"sni":"unused.test"}),
         json!({"allow_insecure":true}),

@@ -125,7 +125,7 @@ pub async fn run() -> Result<(), Error> {
                 crate::protocol::anytls::NAME
             );
             println!(
-                "transports: {} (raw alias; inbound/outbound), TLS server/client via rustls/aws-lc-rs; VLESS encryption native/xorpub/random, 1-RTT/0-RTT",
+                "transports: {} (inbound/outbound; raw/websocket/http-upgrade/splithttp aliases), XHTTP HTTP/1.1/2/3; TLS server/client via rustls/aws-lc-rs; VLESS encryption native/xorpub/random, 1-RTT/0-RTT",
                 crate::transport::Registry::builtin()
                     .names()
                     .collect::<Vec<_>>()

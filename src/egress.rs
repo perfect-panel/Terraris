@@ -645,6 +645,9 @@ impl Engine {
         self.closed.store(true, Ordering::Release);
         self.cancel.cancel();
         self.dns.abort();
+        for proxy in self.proxies.iter().flatten() {
+            proxy.abort();
+        }
         self.jobs
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -653,7 +656,9 @@ impl Engine {
     fn idle(&self) -> bool {
         let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
         while jobs.try_join_next().is_some() {}
-        jobs.is_empty() && self.dns.idle()
+        jobs.is_empty()
+            && self.dns.idle()
+            && self.proxies.iter().flatten().all(|proxy| proxy.idle())
     }
     async fn close(&self, context: &OperationContext) -> Result<(), Error> {
         self.abort();
@@ -666,7 +671,16 @@ impl Engine {
         .await
         .is_some()
         {}
-        self.dns.close(context).await.map_err(Error::Dns)
+        let mut error = None;
+        for proxy in self.proxies.iter().flatten() {
+            if let Err(e) = proxy.close(context).await {
+                error.get_or_insert(Error::Outbound(e));
+            }
+        }
+        if let Err(e) = self.dns.close(context).await {
+            error.get_or_insert(Error::Dns(e));
+        }
+        error.map_or(Ok(()), Err)
     }
 }
 impl Drop for Engine {

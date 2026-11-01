@@ -1,12 +1,21 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Extensible stream transports. Preparation is synchronous and side-effect free;
 //! bind/connect and connection handshakes run with the caller's cancellation budget.
+mod grpc;
+mod h2_pool;
+mod http1;
+mod jobs;
 mod tls;
+mod web;
+mod websocket;
+mod ws_early;
+mod xhttp;
 use crate::{
     buffer::BufferScope, network::Stream, panel, registry::Catalog, time::OperationContext,
 };
 use async_trait::async_trait;
 use std::{net::SocketAddr, sync::Arc};
+pub use web::{Kind as WebKind, Web};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -28,8 +37,21 @@ impl From<std::io::Error> for Error {
     }
 }
 
+pub enum Accepted {
+    Stream(Stream),
+    Quic(Box<quinn::Incoming>),
+}
 #[async_trait]
 pub trait Listener: Send + Sync {
+    async fn close(&self) {}
+    async fn accept_carrier(
+        &self,
+        context: &OperationContext,
+    ) -> Result<(Accepted, SocketAddr), Error> {
+        let (stream, peer) = self.accept(context).await?;
+        Ok((Accepted::Stream(stream), peer))
+    }
+
     fn local_addr(&self) -> Result<SocketAddr, Error>;
     /// Return the raw accepted stream promptly. Expensive per-connection work
     /// belongs in Inbound::handshake, under the protocol's admission limits.
@@ -37,6 +59,37 @@ pub trait Listener: Send + Sync {
 }
 #[async_trait]
 pub trait Inbound: Send + Sync {
+    async fn open_carrier(
+        &self,
+        carrier: Accepted,
+        scope: &BufferScope,
+        context: &OperationContext,
+    ) -> Result<Incoming, Error> {
+        match carrier {
+            Accepted::Stream(stream) => self.open(stream, scope, context).await,
+            Accepted::Quic(_) => Err(Error::Unsupported),
+        }
+    }
+
+    fn abort(&self) {}
+    async fn close(&self, _context: &OperationContext) -> Result<(), Error> {
+        self.abort();
+        Ok(())
+    }
+
+    /// Opens a physical carrier. Multiplexing transports yield independently
+    /// authenticated byte streams, and remain driven by their owning task.
+    async fn open(
+        &self,
+        stream: Stream,
+        scope: &BufferScope,
+        context: &OperationContext,
+    ) -> Result<Incoming, Error> {
+        self.handshake(stream, scope, context)
+            .await
+            .map(Incoming::Single)
+    }
+
     fn reload_required(&self) -> Result<bool, Error> {
         Ok(false)
     }
@@ -66,8 +119,43 @@ pub trait Inbound: Send + Sync {
         Ok(stream)
     }
 }
+/// Maximum concurrent logical streams owned by one multiplexed carrier.
+pub const MAX_MULTIPLEX_STREAMS: usize = 32;
+/// The caller must keep polling a multiplexed carrier while its streams run.
+pub enum Incoming {
+    Single(Stream),
+    Multiplexed(Box<dyn Multiplexed>),
+}
+pub trait Multiplexed: Send + Unpin {
+    /// Cancel and join transport-owned helpers after all logical flows are dropped.
+    fn close(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
+    }
+
+    fn busy(&self) -> bool {
+        false
+    }
+    fn last_activity(&self) -> Option<tokio::time::Instant> {
+        None
+    }
+
+    fn poll_accept(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<Option<Stream>, Error>>;
+    /// Stop new streams while allowing accepted streams to finish.
+    fn drain(&mut self);
+}
 #[async_trait]
 pub trait Outbound: Send + Sync {
+    fn abort(&self) {}
+    fn idle(&self) -> bool {
+        true
+    }
+    async fn close(&self, _context: &OperationContext) -> Result<(), Error> {
+        self.abort();
+        Ok(())
+    }
     /// Addresses have already been resolved under the owning egress policy.
     async fn connect(
         &self,
@@ -121,6 +209,15 @@ impl Registry {
         builder
             .register("tcp", &["raw"], Arc::new(Tcp))
             .expect("builtin transport");
+        web::register(&mut builder, crate::certificate::Settings::default())
+            .expect("builtin web transports");
+        builder
+            .register(
+                "xhttp",
+                &["splithttp"],
+                Arc::new(xhttp::Xhttp::new(crate::certificate::Settings::default())),
+            )
+            .expect("builtin XHTTP");
         builder
     }
     pub fn builtin() -> Self {
@@ -130,8 +227,16 @@ impl Registry {
         settings.validate()?;
         let mut builder = Self::builder();
         builder
-            .register("tcp", &["raw"], Arc::new(TcpWithTls(settings)))
+            .register("tcp", &["raw"], Arc::new(TcpWithTls(settings.clone())))
             .map_err(|_| Error::Configuration("TCP registration"))?;
+        web::register(&mut builder, settings.clone())?;
+        builder
+            .register(
+                "xhttp",
+                &["splithttp"],
+                Arc::new(xhttp::Xhttp::new(settings)),
+            )
+            .map_err(|_| Error::Configuration("XHTTP registration"))?;
         Ok(builder.build())
     }
     pub fn names(&self) -> impl Iterator<Item = &str> {

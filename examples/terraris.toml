@@ -73,3 +73,10 @@ asset_bytes = 134217728
 # [tls.protocols.anytls]
 # cert_file = "tls/anytls-fullchain.pem"
 # key_file = "tls/anytls-privkey.pem"
+
+# Panel transport fields: network/transport = "tcp", "ws", "grpc", "httpupgrade", "xhttp" (alias "splithttp").
+# WS/HTTP Upgrade use host + path; gRPC uses host + service_name.
+# See docs/stream-transports.md for inbound and outbound JSON examples.
+
+# XHTTP uses panel xhttp_mode and xhttp_extra (JSON string); see docs/xhttp.md.
+# HTTP/3 requires security="tls", alpn=["h3"], and a reachable UDP listen port.

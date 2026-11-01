@@ -37,3 +37,17 @@ Trojan framing follows the [official protocol](https://github.com/trojan-gfw/tro
 [tests/interop/proxy](tests/interop/proxy) is an optional Go peer pinned to those upstream modules. It uses the actual upstream AnyTLS session client and UoT implementation to exercise the Rust server. The pinned Xray binary also exercises Trojan TCP/UDP. These helpers are not production dependencies.
 
 TLS identities use rustls with its explicit aws-lc-rs provider. The Rust `md-5` dependency identifies the public AnyTLS padding policy only; it is not used for authentication, signing or encryption. User authentication uses SHA-224 (Trojan) or SHA-256 (AnyTLS) as required by their wire formats.
+
+## Web stream transports
+
+WebSocket framing uses `tokio-tungstenite` / `tungstenite`, following [RFC 6455](https://www.rfc-editor.org/rfc/rfc6455.html). HTTP/1 parsing uses `httparse`; HTTP/2 framing and flow control use `h2`. TLS is still provided by the existing rustls/aws-lc-rs configuration, not a second TLS stack.
+
+gRPC framing follows the [gRPC HTTP/2 protocol](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md). Hunk/MultiHunk field definitions, RPC method names, WebSocket early-data metadata and HTTP Upgrade behavior were checked against Xray's `transport/internet` at the pinned `a4a3dff5b20c2faae567b742c172c7b95e75c083` commit. The Rust adapters, scoped buffering and lifecycle integration are implemented here. No Xray Go transport source is vendored. The optional pinned Xray peer verifies both inbound and outbound interoperability.
+
+## XHTTP / SplitHTTP
+
+`src/transport/xhttp/` is a Rust port of [perfect-panel/Polaris at 56d52fb44958ef3cc2a7fb841cd240f8206234b2](https://github.com/perfect-panel/Polaris/tree/56d52fb44958ef3cc2a7fb841cd240f8206234b2/internal/transport/xhttp). Polaris identifies its source as XTLS/Xray-core SplitHTTP commit `b17a88f9b46d`. Ported files retain MPL-2.0 identifiers and [the full license](LICENSES/MPL-2.0.txt). I/O, flow control, resource budgets, TLS, task ownership and shutdown are adapted to Terraris. HTTP framing uses Hyper/h3 and QUIC uses Quinn; there is no Go production dependency.
+
+The HPACK Huffman code-length table in `src/transport/xhttp/wire.rs` comes from `golang.org/x/net/http2/hpack/tables.go` (Go Authors), implementing RFC 7541 Appendix B. Its BSD-3-Clause notice is retained in [LICENSES/Go-BSD-3-Clause.txt](LICENSES/Go-BSD-3-Clause.txt).
+
+[tests/interop/xhttp](tests/interop/xhttp) is an optional Go test peer compiled from an isolated archive of the pinned Polaris commit. It validates actual upstream client/server interoperability and is not part of normal Rust builds or deployment.

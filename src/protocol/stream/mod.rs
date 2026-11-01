@@ -258,14 +258,14 @@ struct Driver {
 impl Driver {
     async fn serve(
         self: Arc<Self>,
-        stream: Stream,
+        stream: crate::transport::Accepted,
         source: SocketAddr,
         cancel: crate::task::CancellationToken,
         handshake: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<(), crate::task::TaskFailure> {
         use crate::task::TaskFailure;
         let operation = OperationContext::new(
-            cancel,
+            cancel.clone(),
             Some(
                 Deadline::after(self.options.handshake_timeout)
                     .map_err(|_| TaskFailure::Failed("timeout"))?,
@@ -276,11 +276,58 @@ impl Driver {
             .buffers()
             .child(self.options.connection_buffers)
             .map_err(|_| TaskFailure::Failed("buffers"))?;
-        let stream = self
+        let incoming = self
             .transport
-            .handshake(stream, &buffers, &operation)
+            .open_carrier(stream, &buffers, &operation)
             .await
-            .map_err(|_| TaskFailure::Failed("TLS handshake"))?;
+            .map_err(|_| crate::task::TaskFailure::Failed("transport handshake"))?;
+        match incoming {
+            crate::transport::Incoming::Single(stream) => {
+                self.serve_stream(stream, source, operation, handshake, buffers)
+                    .await
+            }
+            crate::transport::Incoming::Multiplexed(carrier) => {
+                drop(handshake);
+                let core = self.core.clone();
+                let timeout = self.options.handshake_timeout;
+                let idle = self.options.idle_timeout;
+                crate::protocol::ingress::multiplex(
+                    carrier,
+                    core,
+                    cancel,
+                    timeout,
+                    idle,
+                    move |stream, cancel| {
+                        let driver = self.clone();
+                        let buffers = buffers.clone();
+                        Box::pin(async move {
+                            let Ok(handshake) = driver.handshakes.clone().try_acquire_owned()
+                            else {
+                                return;
+                            };
+                            let Ok(deadline) = Deadline::after(timeout) else {
+                                return;
+                            };
+                            let operation = OperationContext::new(cancel, Some(deadline));
+                            let _ = driver
+                                .serve_stream(stream, source, operation, handshake, buffers)
+                                .await;
+                        })
+                    },
+                )
+                .await
+            }
+        }
+    }
+    async fn serve_stream(
+        self: Arc<Self>,
+        stream: Stream,
+        source: SocketAddr,
+        operation: OperationContext,
+        handshake: tokio::sync::OwnedSemaphorePermit,
+        buffers: BufferScope,
+    ) -> Result<(), crate::task::TaskFailure> {
+        use crate::task::TaskFailure;
         let ready = operation
             .run(self.engine.handshake(stream, &buffers, &operation))
             .await
@@ -332,7 +379,7 @@ impl Acceptor for Driver {
             && !self.closed()
             && self.core.is_current()
     }
-    fn accept(self: Arc<Self>, stream: Stream, source: SocketAddr) {
+    fn accept(self: Arc<Self>, stream: crate::transport::Accepted, source: SocketAddr) {
         let Ok(connection) = self.connections.clone().try_acquire_owned() else {
             return;
         };
@@ -446,6 +493,7 @@ impl ProtocolDriver for Driver {
     fn abort(&self) {
         self.closed.store(true, Ordering::Release);
         self.stopped.store(true, Ordering::Release);
+        self.transport.abort();
         if let Some(binding) = self
             .binding
             .lock()
@@ -475,6 +523,10 @@ impl ProtocolDriver for Driver {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
+        self.transport
+            .close(context)
+            .await
+            .map_err(|_| runtime::Error::Closed)?;
         Ok(())
     }
 }

@@ -266,7 +266,7 @@ impl Driver {
             .get(uuid)
             .cloned()
     }
-    pub(super) fn accept(self: &Arc<Self>, socket: Stream, source: SocketAddr) {
+    pub(super) fn accept(self: &Arc<Self>, socket: crate::transport::Accepted, source: SocketAddr) {
         let Ok(connection) = self.connections.clone().try_acquire_owned() else {
             return;
         };
@@ -283,13 +283,13 @@ impl Driver {
     }
     async fn serve(
         self: Arc<Self>,
-        socket: Stream,
+        socket: crate::transport::Accepted,
         source: SocketAddr,
         cancel: crate::task::CancellationToken,
         handshake: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<(), TaskFailure> {
         let context = OperationContext::new(
-            cancel,
+            cancel.clone(),
             Some(
                 Deadline::after(self.options.handshake_timeout)
                     .map_err(|_| TaskFailure::Failed("handshake timeout"))?,
@@ -300,6 +300,58 @@ impl Driver {
             .buffers()
             .child(self.options.connection_buffers)
             .map_err(|_| TaskFailure::Failed("connection budget"))?;
+        let incoming = self
+            .transport
+            .open_carrier(socket, &buffers, &context)
+            .await
+            .map_err(|_| TaskFailure::Failed("transport handshake"))?;
+        match incoming {
+            crate::transport::Incoming::Single(stream) => {
+                self.serve_stream(stream, source, context, handshake, buffers)
+                    .await
+            }
+            crate::transport::Incoming::Multiplexed(carrier) => {
+                drop(handshake);
+                let core = self.core.clone();
+                let timeout = self.options.handshake_timeout;
+                let idle = self.options.idle_timeout;
+                crate::protocol::ingress::multiplex(
+                    carrier,
+                    core,
+                    cancel,
+                    timeout,
+                    idle,
+                    move |stream, cancel| {
+                        let driver = self.clone();
+                        let buffers = buffers.clone();
+                        Box::pin(async move {
+                            let Ok(handshake) = driver.handshakes.clone().try_acquire_owned()
+                            else {
+                                return;
+                            };
+                            let Ok(deadline) = Deadline::after(timeout) else {
+                                return;
+                            };
+                            let operation = OperationContext::new(cancel, Some(deadline));
+                            let _ = driver
+                                .serve_stream(stream, source, operation, handshake, buffers)
+                                .await;
+                        })
+                    },
+                )
+                .await
+            }
+        }
+    }
+    async fn serve_stream(
+        self: Arc<Self>,
+        socket: Stream,
+        source: SocketAddr,
+        context: OperationContext,
+        handshake: tokio::sync::OwnedSemaphorePermit,
+        buffers: BufferScope,
+    ) -> Result<(), crate::task::TaskFailure> {
+        use crate::task::TaskFailure;
         let encryption = self
             .encryption
             .lock()
@@ -308,11 +360,6 @@ impl Driver {
         if self.closed() {
             return Err(TaskFailure::Cancelled);
         }
-        let socket = self
-            .transport
-            .handshake(socket, &buffers, &context)
-            .await
-            .map_err(|_| TaskFailure::Failed("transport handshake"))?;
         let mut stream: Stream = if let Some(encryption) = encryption {
             Box::new(
                 encryption
@@ -539,6 +586,7 @@ impl ProtocolDriver for Driver {
     fn abort(&self) {
         self.closed.store(true, Ordering::Release);
         self.stopped.store(true, Ordering::Release);
+        self.transport.abort();
         self.encryption
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -572,6 +620,10 @@ impl ProtocolDriver for Driver {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
+        self.transport
+            .close(context)
+            .await
+            .map_err(|_| runtime::Error::Closed)?;
         Ok(())
     }
 }
@@ -617,7 +669,7 @@ impl crate::protocol::ingress::Acceptor for Driver {
     fn accepting(&self) -> bool {
         Driver::accepting(self)
     }
-    fn accept(self: Arc<Self>, stream: Stream, source: SocketAddr) {
+    fn accept(self: Arc<Self>, stream: crate::transport::Accepted, source: SocketAddr) {
         Driver::accept(&self, stream, source);
     }
 }

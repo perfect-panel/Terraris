@@ -10,7 +10,7 @@ Terraris 的节点入站现包含 VLESS、Trojan 和 AnyTLS。三者共用路由
 | Trojan | SHA-224 密码认证、CONNECT | 原生 UDP ASSOCIATE、可选 UoT v1/v2 | 必须启用 TLS |
 | AnyTLS | SHA-256 密码认证、v1/v2 会话复用与多流 | 每个逻辑流使用 UoT v1/v2 | 必须启用 TLS；支持 settings、padding 策略协商、v2 SYNACK 与心跳 |
 
-Trojan / AnyTLS 使用面板用户的 `uuid` 字段作为密码，不要求它符合 UUID 格式。VLESS 继续校验 UUID。未认证、格式错误和已撤销用户的连接会关闭。Trojan 未提供 HTTP fallback；TLS 未提供 REALITY、Vision、WebSocket、gRPC、XHTTP 或客户端指纹模拟。
+Trojan / AnyTLS 使用面板用户的 `uuid` 字段作为密码，不要求它符合 UUID 格式。VLESS 继续校验 UUID。未认证、格式错误和已撤销用户的连接会关闭。Trojan 未提供 HTTP fallback；TLS 未提供 REALITY、Vision 或客户端指纹模拟。[XHTTP](xhttp.md)、WebSocket、gRPC 和 HTTP Upgrade 已作为公共载体接入，见 [流传输文档](stream-transports.md)。
 
 AnyTLS 服务端校验并下发 `padding_scheme`，为空时使用上游默认策略。MD5 仅识别公开的 padding 配置，认证使用 SHA-256。与上游服务端一致，padding 由客户端在发送方向应用，服务端接收并忽略 WASTE 帧。v2 成功 SYNACK 在目标 TCP 连接建立后发送；UoT 在其请求头完成后确认。
 
@@ -29,7 +29,7 @@ cert_file = "tls/anytls-fullchain.pem"
 key_file = "tls/anytls-privkey.pem"
 ```
 
-面板对应协议项需设置 `network="tcp"`（或 `raw`）、`security="tls"`、`cert_mode="file"`，并指定端口；可设置 `sni` 和 `alpn`。`cert_mode="self"` 也读取上述本地 PEM，用于操作者自行生成并持久保存的证书，不会自动生成或续签。`http` / `dns` 自动签发模式会拒绝。面板密码和证书私钥分别由各自的配置来源提供。
+面板对应协议项需设置 `network="tcp"`（或其他已注册的流传输）、`security="tls"`、`cert_mode="file"`，并指定端口；可设置 `sni` 和 `alpn`。`cert_mode="self"` 也读取上述本地 PEM，用于操作者自行生成并持久保存的证书，不会自动生成或续签。`http` / `dns` 自动签发模式会拒绝。面板密码和证书私钥分别由各自的配置来源提供。
 
 TLS 服务端显式使用 rustls 0.23 的 **aws-lc-rs** provider，启用 TLS 1.2/1.3，禁用 0-RTT 应用数据。证书链按叶证书在前排列，最多 16 张；证书文件和私钥文件分别限制 1 MiB。私钥支持未加密的 PKCS#1、PKCS#8 和 SEC1 PEM，必须仅含一个受支持的私钥，并与叶证书匹配。
 

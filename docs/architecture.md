@@ -1,6 +1,6 @@
 # Terraris 架构设计
 
-状态：架构基线。日期：2026-11-01。B1–B4 基础设施与控制面，以及 B5 VLESS/TCP、UDP/XUDP、GlobalID 迁移、VLESS Encryption、flow 策略和 run CLI 已实现。当前能力见 [README](../README.md) 与 [VLESS 文档](vless.md)；Trojan、AnyTLS、UoT、rustls/aws-lc-rs TLS 入站及本地 PEM 热重载也已接入；生产运维和剩余协议仍在后续阶段。
+状态：架构基线。日期：2026-11-01。B1–B4 基础设施与控制面，以及 B5 VLESS/TCP、UDP/XUDP、GlobalID 迁移、VLESS Encryption、flow 策略和 run CLI 已实现。当前能力见 [README](../README.md) 与 [VLESS 文档](vless.md)；Trojan、AnyTLS、UoT、rustls/aws-lc-rs TLS 入站、本地 PEM 热重载和 WebSocket/gRPC/HTTP Upgrade/XHTTP 传输也已接入；生产运维和剩余协议仍在后续阶段。
 
 Terraris 以 Polaris 的实际模块和生命周期为架构基线：`panel` 隔离面板协议，`supervisor` 管服务器配置代次，`controller` 管单协议用户与维护任务，`protocol::runtimekit` 统一运行时装配，`protocol::flow` 统一数据面策略。通过 Rust 的所有权、类型和异步任务模型实现这些边界。
 
@@ -51,7 +51,7 @@ TCP 字节流和 UDP 数据报分别建模。QUIC 流可以交付字节流接口
 
 `route` / `dns` / `outbound` 已实现独立模块并由公共 `egress` 接入 VLESS、Trojan、AnyTLS 的 TCP/UDP/XUDP/UoT：顺序规则、GeoData、分域 DNS、缓存、DoH/DoT，以及直连/阻断/DNS/SOCKS5/HTTP/VLESS 出站。限速按协议/订阅共享。实现语义和当前范围见 [路由与 DNS](routing-dns.md)。
 
-协议、出站和字节流传输已有工厂注册表；Node 使用 `Supervisor<protocol::Registry>`，内置 VLESS/Trojan/AnyTLS、现有出站与 TCP/raw（含入站和出站 TLS）通过注册表装配。新增实现不需要更改 Node、Supervisor 或路由的协议分派；接口与生命周期见 [注册表](registries.md)。
+协议、出站和字节流传输已有工厂注册表；Node 使用 `Supervisor<protocol::Registry>`，内置 VLESS/Trojan/AnyTLS、现有出站与 TCP/raw、WS、gRPC、HTTP Upgrade（含入站和出站 TLS）通过注册表装配。新增实现不需要更改 Node、Supervisor 或路由的协议分派；接口与生命周期见 [注册表](registries.md)。
 
 以下是目标模块划分；当前已实现 `app`、`config`、`panel` 及 B1–B4 基础设施和控制面。B5 已引入 VLESS、flow、限速和设备执行器；其余目标模块按后续阶段实施：
 
@@ -295,7 +295,8 @@ DNS 和出站使用结构化能力声明。像 Polaris 的共享 Egress 一样�
 | --- | --- | --- |
 | 首个协议原型 | VLESS TCP、UDP/XUDP、VLESS Encryption | B5 已完成本地 Xray 互通、用户热更新、撤销与计量验证；能力边界见 VLESS 文档 |
 | 已完成协议扩展 | Trojan TCP/UDP、AnyTLS v1/v2、UoT、TLS 入站与本地 PEM 热重载 | 复用同一准入和流处理层；已验证 Xray Trojan 与官方 AnyTLS 客户端互通 |
-| 第二轮扩展 | VLESS 其他传输、TUIC v5、Hysteria2 | 各自独立互通矩阵；QUIC 需验证拥塞控制、UDP 和认证时序 |
+| 已完成传输扩展 | WebSocket、gRPC、HTTP Upgrade、XHTTP 的入站和出站 | gRPC 池、WS 早期数据、XHTTP HTTP/1.1/2/3 + XMUX；Xray/Polaris 双向互通、代次排空和资源回收已通过本地验证 |
+| 第二轮扩展 | TUIC v5、Hysteria2 | 各自独立互通矩阵；QUIC 需验证拥塞控制、UDP 和认证时序 |
 | 单独立项 | Shadowsocks 2022/传统 AEAD、REALITY、Vision、XHTTP、VMess 及其他协议 | 明确协议版本、实现来源、客户端互通与维护成本后排期 |
 
 SS2022 延后到后续扩展。其 `set_user_manager` 提供 EIH 多用户入口，但仍须单独验证在线替换、身份回传和撤销能否接入统一策略，不能用单密码服务器冒充多用户支持。

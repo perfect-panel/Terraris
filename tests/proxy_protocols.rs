@@ -46,6 +46,20 @@ fn users() -> Value {
 fn config(name: &str, address: SocketAddr) -> Value {
     json!({"code":200,"data":{"pull_interval":300,"push_interval":300,"traffic_report_threshold":1024,"ip_strategy":"prefer_ipv4","dns":[],"block":[],"outbound":[],"protocols":[{"type":name,"enable":true,"port":address.port(),"network":"tcp","security":"tls","sni":"localhost","cert_mode":"file","uot":true}],"total":1}})
 }
+fn web_config(name: &str, address: SocketAddr, transport: &str) -> Value {
+    let mut value = config(name, address);
+    let p = &mut value["data"]["protocols"][0];
+    p["network"] = json!(transport);
+    if transport != "tcp" {
+        p["host"] = json!("localhost");
+        if transport == "grpc" {
+            p["service_name"] = json!("terraris");
+        } else {
+            p["path"] = json!("/relay");
+        }
+    }
+    value
+}
 struct Harness {
     panel: MockPanel,
     supervisor: Arc<Supervisor<protocol::Registry>>,
@@ -57,6 +71,21 @@ struct Harness {
 }
 impl Harness {
     async fn new(name: &'static str) -> Self {
+        Self::with_transport(name, "tcp").await
+    }
+    async fn with_transport(name: &'static str, transport: &str) -> Self {
+        Self::with_security(name, transport, true).await
+    }
+    async fn with_security(name: &'static str, transport: &str, secure: bool) -> Self {
+        Self::with_xhttp_options(name, transport, secure, None).await
+    }
+    async fn with_xhttp_options(
+        name: &'static str,
+        transport: &str,
+        secure: bool,
+        xhttp: Option<(&str, &str, Value)>,
+    ) -> Self {
+        let quic = xhttp.as_ref().is_some_and(|(_, alpn, _)| *alpn == "h3");
         let address = TcpListener::bind("127.0.0.1:0")
             .await
             .unwrap()
@@ -64,8 +93,23 @@ impl Harness {
             .unwrap();
         let files = tempfile::tempdir().unwrap();
         let cert = write_identity(files.path());
+        let mut value = web_config(name, address, transport);
+        if !secure {
+            let p = &mut value["data"]["protocols"][0];
+            p["security"] = json!("none");
+            p["sni"] = json!("");
+            p["cert_mode"] = json!("");
+        }
+        if let Some((mode, alpn, extra)) = xhttp {
+            let p = &mut value["data"]["protocols"][0];
+            p["xhttp_mode"] = json!(mode);
+            p["xhttp_extra"] = json!(extra.to_string());
+            if !alpn.is_empty() {
+                p["alpn"] = json!([alpn]);
+            }
+        }
         let panel = MockPanel::start(vec![
-            Reply::json(config(name, address)).etag("\"proxy-config\""),
+            Reply::json(value).etag("\"proxy-config\""),
             Reply::json(users()),
         ])
         .await;
@@ -97,8 +141,14 @@ impl Harness {
                 Arc::new(factory),
                 scope,
                 terraris::supervisor::Options {
-                    drain_timeout: Duration::from_secs(30),
-                    close_timeout: Duration::from_secs(1),
+                    // A killed UDP peer cannot send QUIC CONNECTION_CLOSE. Exercise
+                    // the bounded forced-drain path without a 30-second fixture wait.
+                    drain_timeout: if quic {
+                        Duration::from_millis(100)
+                    } else {
+                        Duration::from_secs(30)
+                    },
+                    close_timeout: Duration::from_secs(if quic { 3 } else { 1 }),
                     ..Default::default()
                 },
                 Metrics::default(),
@@ -928,4 +978,1025 @@ key_file="key.pem"
     protocol.alpn.clear();
     protocol.protocol = ProtocolName::new("trojan").unwrap();
     assert!(settings.prepare(&protocol).is_err());
+}
+
+async fn web_peer(h: &Harness, transport: &str) -> (Stream, Budget) {
+    transport_peer(h.cert.clone(), h.address, transport).await
+}
+async fn transport_peer(
+    cert: rustls::pki_types::CertificateDer<'static>,
+    address: SocketAddr,
+    transport: &str,
+) -> (Stream, Budget) {
+    transport_peer_security(cert, address, transport, true).await
+}
+async fn transport_peer_security(
+    cert: rustls::pki_types::CertificateDer<'static>,
+    address: SocketAddr,
+    transport: &str,
+    secure: bool,
+) -> (Stream, Budget) {
+    let connector = transport_connector(cert, address, transport, secure, 0).await;
+    let (budget, scope) = resources();
+    let (stream, _) = connector.connect(&[address], &scope, &ctx()).await.unwrap();
+    (stream, budget)
+}
+async fn transport_connector(
+    cert: rustls::pki_types::CertificateDer<'static>,
+    address: SocketAddr,
+    transport: &str,
+    secure: bool,
+    early: usize,
+) -> Arc<dyn terraris::transport::Outbound> {
+    transport_connector_extra(cert, address, transport, secure, early, None).await
+}
+async fn transport_connector_extra(
+    cert: rustls::pki_types::CertificateDer<'static>,
+    address: SocketAddr,
+    transport: &str,
+    secure: bool,
+    early: usize,
+    xhttp: Option<(&str, &str, Value)>,
+) -> Arc<dyn terraris::transport::Outbound> {
+    let mut value = config("vless", address);
+    value["data"]["outbound"] = json!([{"name":"remote","protocol":"vless","address":"127.0.0.1","port":address.port(),"uuid":PASSWORD,"security":"tls","sni":"localhost","host":"localhost","transport":transport,"path":if transport=="grpc"{""}else{"/relay"},"service_name":if transport=="grpc"{"terraris"}else{""}}]);
+    if early > 0 {
+        value["data"]["outbound"][0]["path"] = json!(format!("/relay?ed={early}"));
+    }
+    if !secure {
+        let outbound = &mut value["data"]["outbound"][0];
+        outbound["security"] = json!("none");
+        outbound["sni"] = json!("");
+    }
+    if let Some((mode, alpn, extra)) = xhttp {
+        let o = &mut value["data"]["outbound"][0];
+        o["xhttp_mode"] = json!(mode);
+        o["xhttp_extra"] = json!(extra.to_string());
+        if !alpn.is_empty() {
+            o["alpn"] = json!([alpn]);
+        }
+    }
+    let panel = MockPanel::start(vec![Reply::json(value)]).await;
+    let mut options = panel.options();
+    options.wire_mode = WireMode::Json;
+    let connection = PPanelConnection::new(options).unwrap();
+    let terraris::panel::Fetch::Changed { value, .. } =
+        connection.server().get_config(None).await.unwrap()
+    else {
+        panic!("config");
+    };
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert.clone()).unwrap();
+    let roots = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    terraris::transport::Registry::builtin()
+        .outbound(&value.outbounds[0], Arc::new(roots))
+        .unwrap()
+}
+#[tokio::test]
+async fn web_transports_carry_vless_tls_with_flow_control_and_release_resources() {
+    for transport in ["ws", "httpupgrade", "grpc"] {
+        for secure in [false, true] {
+            let h = Harness::with_security("vless", transport, secure).await;
+            let (target, echo) = echo().await;
+            let (mut stream, budget) =
+                transport_peer_security(h.cert.clone(), h.address, transport, secure).await;
+            terraris::protocol::vless::wire::Request {
+                uuid: *uuid::Uuid::parse_str(PASSWORD).unwrap().as_bytes(),
+                command: terraris::protocol::vless::wire::Command::Tcp,
+                target: Some(Address::from_socket(target).unwrap()),
+            }
+            .write(&mut stream)
+            .await
+            .unwrap();
+            let mut response = [0; 2];
+            ctx()
+                .run(stream.read_exact(&mut response))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(response, [0, 0], "{transport}");
+            let payload = vec![42; 512 << 10];
+            let mut reply = vec![0; payload.len()];
+            let (mut read, mut write) = tokio::io::split(stream);
+            ctx()
+                .run(async {
+                    tokio::try_join!(write.write_all(&payload), read.read_exact(&mut reply))
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(reply, payload, "{transport}");
+            if transport != "ws" {
+                ctx().run(write.shutdown()).await.unwrap().unwrap();
+                let mut eof = [0];
+                assert_eq!(
+                    ctx().run(read.read(&mut eof)).await.unwrap().unwrap(),
+                    0,
+                    "{transport} half-close"
+                );
+            }
+            drop(read);
+            drop(write);
+            assert_eq!(budget.snapshot().used().bytes(), 0, "{transport}");
+            h.close().await;
+            echo.abort();
+            echo.await.ok();
+        }
+    }
+}
+#[tokio::test]
+#[ignore = "requires TERRARIS_XRAY pinned to the documented Xray commit"]
+async fn official_xray_web_transports_vless_and_trojan_interoperate() {
+    for protocol in ["vless", "trojan"] {
+        for (transport, multi) in [
+            ("ws", false),
+            ("httpupgrade", false),
+            ("grpc", false),
+            ("grpc", true),
+        ] {
+            let h = Harness::with_transport(protocol, transport).await;
+            let (target, echo) = echo().await;
+            let socks = TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap()
+                .local_addr()
+                .unwrap();
+            let mut settings = json!({"network":transport,"security":"tls","tlsSettings":{"serverName":"localhost","pinnedPeerCertSha256":format!("{:x}",Sha256::digest(h.cert.as_ref()))}});
+            match transport {
+                "ws" => settings["wsSettings"] = json!({"host":"localhost","path":"/relay"}),
+                "httpupgrade" => {
+                    settings["httpupgradeSettings"] = json!({"host":"localhost","path":"/relay"})
+                }
+                "grpc" => {
+                    settings["grpcSettings"] =
+                        json!({"authority":"localhost","serviceName":"terraris","multiMode":multi})
+                }
+                _ => unreachable!(),
+            }
+            let mut outbound = json!({"protocol":protocol,"streamSettings":settings});
+            outbound["settings"] = if protocol == "trojan" {
+                json!({"servers":[{"address":"127.0.0.1","port":h.address.port(),"password":PASSWORD}]})
+            } else {
+                json!({"vnext":[{"address":"127.0.0.1","port":h.address.port(),"users":[{"id":PASSWORD,"encryption":"none"}]}]})
+            };
+            let file = h.files.path().join("web-client.json");
+            let log = h.files.path().join("web-client.log");
+            std::fs::write(&file,serde_json::to_vec(&json!({"log":{"loglevel":"warning"},"inbounds":[{"listen":"127.0.0.1","port":socks.port(),"protocol":"socks","settings":{"auth":"noauth"}}],"outbounds":[outbound]})).unwrap()).unwrap();
+            let mut child =
+                tokio::process::Command::new(std::env::var("TERRARIS_XRAY").expect("Xray binary"))
+                    .args(["run", "-c"])
+                    .arg(file)
+                    .stdout(std::fs::File::create(&log).unwrap())
+                    .stderr(std::fs::OpenOptions::new().append(true).open(&log).unwrap())
+                    .kill_on_drop(true)
+                    .spawn()
+                    .unwrap();
+            let start = tokio::time::Instant::now();
+            loop {
+                if TcpStream::connect(socks).await.is_ok() {
+                    break;
+                }
+                assert!(
+                    start.elapsed() < Duration::from_secs(5) && child.try_wait().unwrap().is_none(),
+                    "{}",
+                    std::fs::read_to_string(&log).unwrap()
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let mut streams = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = socks_connect(socks, 1, target).await;
+                exchange(&mut stream, &[7; 32768]).await;
+                streams.push(stream);
+            }
+            for mut stream in streams {
+                exchange(&mut stream, b"reuse existing logical streams").await;
+            }
+            child.start_kill().unwrap();
+            child.wait().await.unwrap();
+            h.close().await;
+            echo.abort();
+            echo.await.ok();
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires TERRARIS_XRAY pinned to the documented Xray commit"]
+async fn native_web_outbounds_interoperate_with_xray_servers() {
+    for transport in ["ws", "httpupgrade", "grpc"] {
+        let files = tempfile::tempdir().unwrap();
+        let cert = write_identity(files.path());
+        let (target, echo) = echo().await;
+        let address = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let mut settings = json!({"network":transport,"security":"tls","tlsSettings":{"certificates":[{"certificateFile":files.path().join("cert.pem"),"keyFile":files.path().join("key.pem")}]}});
+        match transport {
+            "ws" => settings["wsSettings"] = json!({"host":"localhost","path":"/relay"}),
+            "httpupgrade" => {
+                settings["httpupgradeSettings"] = json!({"host":"localhost","path":"/relay"})
+            }
+            "grpc" => settings["grpcSettings"] = json!({"serviceName":"terraris"}),
+            _ => unreachable!(),
+        }
+        let file = files.path().join("web-server.json");
+        let log = files.path().join("web-server.log");
+        std::fs::write(&file,serde_json::to_vec(&json!({"log":{"loglevel":"warning"},"inbounds":[{"listen":"127.0.0.1","port":address.port(),"protocol":"vless","settings":{"clients":[{"id":PASSWORD}],"decryption":"none"},"streamSettings":settings}],"outbounds":[{"protocol":"freedom","settings":{"finalRules":[{"action":"allow","ip":["127.0.0.1/32"]}]}}]})).unwrap()).unwrap();
+        let mut child =
+            tokio::process::Command::new(std::env::var("TERRARIS_XRAY").expect("Xray binary"))
+                .args(["run", "-c"])
+                .arg(file)
+                .stdout(std::fs::File::create(&log).unwrap())
+                .stderr(std::fs::OpenOptions::new().append(true).open(&log).unwrap())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+        let start = tokio::time::Instant::now();
+        loop {
+            if TcpStream::connect(address).await.is_ok() {
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(5) && child.try_wait().unwrap().is_none(),
+                "{}",
+                std::fs::read_to_string(&log).unwrap()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let connector = transport_connector(
+            cert,
+            address,
+            transport,
+            true,
+            if transport == "ws" { 2048 } else { 0 },
+        )
+        .await;
+        let (budget, scope) = resources();
+        for _ in 0..3 {
+            let (mut stream, _) = connector.connect(&[address], &scope, &ctx()).await.unwrap();
+            terraris::protocol::vless::wire::Request {
+                uuid: *uuid::Uuid::parse_str(PASSWORD).unwrap().as_bytes(),
+                command: terraris::protocol::vless::wire::Command::Tcp,
+                target: Some(Address::from_socket(target).unwrap()),
+            }
+            .write(&mut stream)
+            .await
+            .unwrap();
+            stream.write_all(b"first payload").await.unwrap();
+            stream.flush().await.unwrap();
+            let mut reply = [0; 2];
+            ctx()
+                .run(stream.read_exact(&mut reply))
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "{transport}: {error:?}; {}",
+                        std::fs::read_to_string(&log).unwrap()
+                    )
+                })
+                .unwrap();
+            assert_eq!(reply, [0, 0], "{transport}");
+            let mut first = [0; 13];
+            ctx()
+                .run(stream.read_exact(&mut first))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&first, b"first payload");
+            exchange(&mut stream, &[2; 32768]).await;
+            drop(stream);
+        }
+        connector.close(&ctx()).await.unwrap();
+        assert_eq!(budget.snapshot().used().bytes(), 0);
+        child.start_kill().unwrap();
+        child.wait().await.unwrap();
+        echo.abort();
+        echo.await.ok();
+    }
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct TestHunks {
+    #[prost(bytes = "vec", repeated, tag = "1")]
+    data: Vec<Vec<u8>>,
+}
+fn grpc_message(parts: Vec<Vec<u8>>) -> bytes::Bytes {
+    use prost::Message;
+    let body = TestHunks { data: parts }.encode_to_vec();
+    let mut frame = vec![0];
+    frame.extend((body.len() as u32).to_be_bytes());
+    frame.extend(body);
+    frame.into()
+}
+async fn grpc_open(
+    sender: &h2::client::SendRequest<bytes::Bytes>,
+    multi: bool,
+) -> (h2::RecvStream, h2::SendStream<bytes::Bytes>) {
+    let mut sender = sender.clone().ready().await.unwrap();
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(format!(
+            "https://localhost/terraris/{}",
+            if multi { "TunMulti" } else { "Tun" }
+        ))
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .body(())
+        .unwrap();
+    let (response, send) = sender.send_request(request, false).unwrap();
+    let response = ctx().run(response).await.unwrap().unwrap();
+    assert_eq!(response.status(), 200);
+    (response.into_body(), send)
+}
+async fn grpc_reply(recv: &mut h2::RecvStream, n: usize) -> Vec<u8> {
+    use prost::Message;
+    ctx()
+        .run(async {
+            let mut framed = Vec::<u8>::new();
+            let mut output = Vec::new();
+            while output.len() < n {
+                let bytes = recv.data().await.expect("gRPC EOF").unwrap();
+                let len = bytes.len();
+                framed.extend(bytes);
+                recv.flow_control().release_capacity(len).unwrap();
+                while framed.len() >= 5 {
+                    assert_eq!(framed[0], 0);
+                    let length = u32::from_be_bytes(framed[1..5].try_into().unwrap()) as usize;
+                    if framed.len() < 5 + length {
+                        break;
+                    }
+                    let message = TestHunks::decode(&framed[5..5 + length]).unwrap();
+                    for part in message.data {
+                        output.extend(part);
+                    }
+                    framed.drain(..5 + length);
+                }
+            }
+            assert_eq!(output.len(), n);
+            assert!(framed.is_empty());
+            output
+        })
+        .await
+        .unwrap()
+}
+#[tokio::test]
+async fn grpc_multiplexes_isolates_bad_streams_and_drains_generations() {
+    let h = Harness::with_transport("vless", "grpc").await;
+    let (target, echo) = echo().await;
+    let mut builder = h2::client::Builder::new();
+    builder.initial_window_size(1);
+    let (sender, connection) = builder.handshake(h.tls().await).await.unwrap();
+    let driver = tokio::spawn(connection);
+    let (mut bad, mut bad_send) = grpc_open(&sender, false).await;
+    bad_send
+        .send_data(bytes::Bytes::from_static(&[1, 0, 0, 0, 0]), false)
+        .unwrap();
+    assert!(
+        ctx()
+            .run(bad.data())
+            .await
+            .unwrap()
+            .is_none_or(|r| r.is_err())
+    );
+    drop(bad);
+    drop(bad_send);
+    let mut request = Vec::new();
+    terraris::protocol::vless::wire::Request {
+        uuid: *uuid::Uuid::parse_str(PASSWORD).unwrap().as_bytes(),
+        command: terraris::protocol::vless::wire::Command::Tcp,
+        target: Some(Address::from_socket(target).unwrap()),
+    }
+    .write(&mut request)
+    .await
+    .unwrap();
+    let (mut one, mut write_one) = grpc_open(&sender, false).await;
+    let (mut two, mut write_two) = grpc_open(&sender, true).await;
+    let mut single = request.clone();
+    single.extend(b"first");
+    write_one
+        .send_data(grpc_message(vec![single]), false)
+        .unwrap();
+    write_two
+        .send_data(
+            grpc_message(vec![request.clone(), b"second".to_vec()]),
+            false,
+        )
+        .unwrap();
+    assert_eq!(grpc_reply(&mut one, 7).await, b"\0\0first");
+    assert_eq!(grpc_reply(&mut two, 8).await, b"\0\0second");
+    let mut next = web_config("vless", h.address, "grpc");
+    next["data"]["traffic_report_threshold"] = json!(2048);
+    h.panel.push(Reply::json(next));
+    h.panel.push(Reply::json(users()));
+    h.supervisor.sync_config(&ctx()).await.unwrap();
+    write_one
+        .send_data(grpc_message(vec![b"draining".to_vec()]), false)
+        .unwrap();
+    assert_eq!(grpc_reply(&mut one, 8).await, b"draining");
+    let mut old_sender = sender.clone().ready().await.unwrap();
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("https://localhost/terraris/Tun")
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .body(())
+        .unwrap();
+    if let Ok((response, _send)) = old_sender.send_request(request, false)
+        && let Ok(response) = ctx().run(response).await.unwrap()
+    {
+        let mut body = response.into_body();
+        assert!(
+            ctx()
+                .run(body.data())
+                .await
+                .unwrap()
+                .is_none_or(|r| r.is_err())
+        );
+    }
+    let (mut fresh, budget) = web_peer(&h, "grpc").await;
+    terraris::protocol::vless::wire::Request {
+        uuid: *uuid::Uuid::parse_str(PASSWORD).unwrap().as_bytes(),
+        command: terraris::protocol::vless::wire::Command::Tcp,
+        target: Some(Address::from_socket(target).unwrap()),
+    }
+    .write(&mut fresh)
+    .await
+    .unwrap();
+    let mut response = [0; 2];
+    ctx()
+        .run(fresh.read_exact(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    exchange(&mut fresh, b"new generation").await;
+    h.panel.push(Reply::json(json!({"users":[]})));
+    h.supervisor
+        .runtime(&ProtocolName::new("vless").unwrap())
+        .unwrap()
+        .controller
+        .sync_users(&ctx())
+        .await
+        .unwrap();
+    assert!(
+        ctx()
+            .run(one.data())
+            .await
+            .unwrap()
+            .is_none_or(|r| r.is_err())
+    );
+    assert!(
+        ctx()
+            .run(two.data())
+            .await
+            .unwrap()
+            .is_none_or(|r| r.is_err())
+    );
+    assert!(ctx().run(fresh.read_u8()).await.unwrap().is_err());
+    drop(fresh);
+    assert_eq!(budget.snapshot().used().bytes(), 0);
+    drop(one);
+    drop(two);
+    drop(write_one);
+    drop(write_two);
+    drop(sender);
+    drop(old_sender);
+    h.close().await;
+    driver.abort();
+    driver.await.ok();
+    echo.abort();
+    echo.await.ok();
+}
+
+#[tokio::test]
+async fn xhttp_all_modes_http_versions_streaming_reuse_and_shutdown() {
+    for mode in ["auto", "packet-up", "stream-up", "stream-one"] {
+        for (secure, alpn) in [(false, ""), (true, "http/1.1"), (true, "h2"), (true, "h3")] {
+            eprintln!("XHTTP {mode} {secure} {alpn}");
+            let extra = json!({"scMinPostsIntervalMs":1,"scMaxEachPostBytes":65536,"xmux":{"maxConnections":1,"hMaxRequestTimes":5}});
+            let h = Harness::with_xhttp_options(
+                "vless",
+                "xhttp",
+                secure,
+                Some((mode, alpn, extra.clone())),
+            )
+            .await;
+            let connector = transport_connector_extra(
+                h.cert.clone(),
+                h.address,
+                "xhttp",
+                secure,
+                0,
+                Some((mode, alpn, extra)),
+            )
+            .await;
+            let (budget, scope) = resources();
+            let (target, echo) = echo().await;
+            for i in 0..2 {
+                let (mut stream, _) = ctx()
+                    .run(connector.connect(&[h.address], &scope, &ctx()))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                terraris::protocol::vless::wire::Request {
+                    uuid: *uuid::Uuid::parse_str(PASSWORD).unwrap().as_bytes(),
+                    command: terraris::protocol::vless::wire::Command::Tcp,
+                    target: Some(Address::from_socket(target).unwrap()),
+                }
+                .write(&mut stream)
+                .await
+                .unwrap();
+                let mut response = [0; 2];
+                ctx()
+                    .run(stream.read_exact(&mut response))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(response, [0, 0]);
+                let payload = (0..256 * 1024)
+                    .map(|n| (n * 197 + i * 71) as u8)
+                    .collect::<Vec<_>>();
+                let mut output = vec![0; payload.len()];
+                let (mut r, mut w) = tokio::io::split(stream);
+                ctx()
+                    .run(async {
+                        tokio::try_join!(w.write_all(&payload), r.read_exact(&mut output))
+                    })
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(payload, output);
+                if !matches!(mode, "packet-up" | "auto") {
+                    ctx().run(w.shutdown()).await.unwrap().unwrap();
+                    let mut b = [0];
+                    assert_eq!(ctx().run(r.read(&mut b)).await.unwrap().unwrap(), 0);
+                }
+                drop(r);
+                drop(w);
+            }
+            connector.close(&ctx()).await.unwrap();
+            assert!(connector.idle());
+            assert_eq!(budget.snapshot().used().bytes(), 0);
+            h.close().await;
+            echo.abort();
+            echo.await.ok();
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires TERRARIS_POLARIS_XHTTP built from pinned Polaris"]
+async fn polaris_xhttp_clients_interoperate_with_native_servers() {
+    for (mode, extra) in xhttp_interop_cases() {
+        for alpn in ["", "http/1.1", "h2", "h3"] {
+            let h = Harness::with_xhttp_options(
+                "vless",
+                "xhttp",
+                !alpn.is_empty(),
+                Some((mode, alpn, extra.clone())),
+            )
+            .await;
+            let (target, echo) = echo().await;
+            let child = tokio::process::Command::new(
+                std::env::var("TERRARIS_POLARIS_XHTTP").expect("Polaris peer"),
+            )
+            .args([
+                "-role",
+                "client",
+                "-server",
+                &h.address.to_string(),
+                "-target",
+                &target.to_string(),
+                "-mode",
+                mode,
+                "-alpn",
+                alpn,
+                "-extra",
+                &extra.to_string(),
+                "-cert",
+            ])
+            .arg(h.files.path().join("cert.pem"))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+            let output = tokio::time::timeout(Duration::from_secs(40), child.wait_with_output())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{mode}/{alpn}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            h.close().await;
+            echo.abort();
+            echo.await.ok();
+        }
+    }
+}
+#[tokio::test]
+#[ignore = "requires TERRARIS_POLARIS_XHTTP built from pinned Polaris"]
+async fn native_xhttp_clients_interoperate_with_polaris_servers() {
+    use tokio::io::AsyncBufReadExt;
+    for (mode, extra) in xhttp_interop_cases() {
+        for alpn in ["", "http/1.1", "h2", "h3"] {
+            let files = tempfile::tempdir().unwrap();
+            let cert = write_identity(files.path());
+            let log = files.path().join("polaris.log");
+            let mut child = tokio::process::Command::new(
+                std::env::var("TERRARIS_POLARIS_XHTTP").expect("Polaris peer"),
+            )
+            .args([
+                "-role",
+                "server",
+                "-mode",
+                mode,
+                "-alpn",
+                alpn,
+                "-extra",
+                &extra.to_string(),
+                "-cert",
+            ])
+            .arg(files.path().join("cert.pem"))
+            .arg("-key")
+            .arg(files.path().join("key.pem"))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::fs::File::create(&log).unwrap())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+            let mut lines = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+            let ready = ctx()
+                .run(lines.next_line())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let address: SocketAddr = ready.strip_prefix("READY ").unwrap().parse().unwrap();
+            let connector = transport_connector_extra(
+                cert,
+                address,
+                "xhttp",
+                !alpn.is_empty(),
+                0,
+                Some((mode, alpn, extra.clone())),
+            )
+            .await;
+            let (budget, scope) = resources();
+            for i in 0..3 {
+                let (mut stream, _) = connector
+                    .connect(&[address], &scope, &ctx())
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "{mode}/{alpn}: {e:?}; {}",
+                            std::fs::read_to_string(&log).unwrap()
+                        )
+                    });
+                terraris::protocol::vless::wire::Request {
+                    uuid: *uuid::Uuid::parse_str(PASSWORD).unwrap().as_bytes(),
+                    command: terraris::protocol::vless::wire::Command::Tcp,
+                    target: Some(Address::from_socket("127.0.0.1:443".parse().unwrap()).unwrap()),
+                }
+                .write(&mut stream)
+                .await
+                .unwrap();
+                let mut response = [0; 2];
+                ctx()
+                    .run(stream.read_exact(&mut response))
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "{mode}/{alpn}: {e:?}; {}",
+                            std::fs::read_to_string(&log).unwrap()
+                        )
+                    })
+                    .unwrap();
+                assert_eq!(response, [0, 0]);
+                let payload = (0..256 * 1024)
+                    .map(|n| (n * 197 + i * 71) as u8)
+                    .collect::<Vec<_>>();
+                let mut output = vec![0; payload.len()];
+                let (mut r, mut w) = tokio::io::split(stream);
+                ctx()
+                    .run(async {
+                        tokio::try_join!(w.write_all(&payload), r.read_exact(&mut output))
+                    })
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(payload, output);
+                drop(r);
+                drop(w);
+            }
+            connector.close(&ctx()).await.unwrap();
+            assert_eq!(budget.snapshot().used().bytes(), 0);
+            child.start_kill().unwrap();
+            child.wait().await.unwrap();
+        }
+    }
+}
+#[tokio::test]
+#[ignore = "requires TERRARIS_XRAY pinned to the documented Xray commit"]
+async fn xray_xhttp_clients_interoperate_with_native_servers() {
+    for mode in ["auto", "packet-up", "stream-up", "stream-one"] {
+        for alpn in ["http/1.1", "h2", "h3"] {
+            eprintln!("Xray -> native {mode}/{alpn}");
+            let extra = json!({"scMinPostsIntervalMs":1,"scMaxEachPostBytes":65536,"xmux":{"maxConnections":1,"hMaxRequestTimes":5}});
+            let h = Harness::with_xhttp_options(
+                "vless",
+                "xhttp",
+                true,
+                Some((mode, alpn, extra.clone())),
+            )
+            .await;
+            let (target, echo) = echo().await;
+            let socks = TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap()
+                .local_addr()
+                .unwrap();
+            let settings = json!({"network":"xhttp","security":"tls","tlsSettings":{"serverName":"localhost","alpn":[alpn],"pinnedPeerCertSha256":format!("{:x}",Sha256::digest(h.cert.as_ref()))},"xhttpSettings":{"host":"localhost","path":"/relay","mode":mode,"extra":extra}});
+            let value = json!({"log":{"loglevel":"info"},"inbounds":[{"listen":"127.0.0.1","port":socks.port(),"protocol":"socks","settings":{"auth":"noauth"}}],"outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"127.0.0.1","port":h.address.port(),"users":[{"id":PASSWORD,"encryption":"none"}]}]},"streamSettings":settings}]});
+            let log = h.files.path().join("xray-client.log");
+            let mut child = xray_process(&value, h.files.path(), &log).await;
+            for _ in 0..2 {
+                let (mut stream, _) = socks_connect(socks, 1, target).await;
+                exchange(&mut stream, &[71; 65536]).await;
+            }
+            child.start_kill().unwrap();
+            child.wait().await.unwrap();
+            h.close().await;
+            echo.abort();
+            echo.await.ok();
+        }
+    }
+}
+#[tokio::test]
+#[ignore = "requires TERRARIS_XRAY pinned to the documented Xray commit"]
+async fn native_xhttp_clients_interoperate_with_xray_servers() {
+    for mode in ["auto", "packet-up", "stream-up", "stream-one"] {
+        for alpn in ["http/1.1", "h2", "h3"] {
+            let files = tempfile::tempdir().unwrap();
+            let cert = write_identity(files.path());
+            let (target, echo) = echo().await;
+            let address = TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap()
+                .local_addr()
+                .unwrap();
+            let extra = json!({"scMinPostsIntervalMs":1,"scMaxEachPostBytes":65536,"xmux":{"maxConnections":1,"hMaxRequestTimes":5}});
+            let settings = json!({"network":"xhttp","security":"tls","tlsSettings":{"alpn":[alpn],"certificates":[{"certificateFile":files.path().join("cert.pem"),"keyFile":files.path().join("key.pem")}]},"xhttpSettings":{"host":"localhost","path":"/relay","mode":mode,"extra":extra}});
+            let value = json!({"log":{"loglevel":"info"},"inbounds":[{"listen":"127.0.0.1","port":address.port(),"protocol":"vless","settings":{"clients":[{"id":PASSWORD}],"decryption":"none"},"streamSettings":settings}],"outbounds":[{"protocol":"freedom","settings":{"finalRules":[{"action":"allow","ip":["127.0.0.1/32"]}]}}]});
+            let log = files.path().join("xray-server.log");
+            let mut child = xray_process(&value, files.path(), &log).await;
+            let connector = transport_connector_extra(
+                cert,
+                address,
+                "xhttp",
+                true,
+                0,
+                Some((mode, alpn, extra)),
+            )
+            .await;
+            let (budget, scope) = resources();
+            for _ in 0..2 {
+                let (mut stream, _) = connector.connect(&[address], &scope, &ctx()).await.unwrap();
+                terraris::protocol::vless::wire::Request {
+                    uuid: *uuid::Uuid::parse_str(PASSWORD).unwrap().as_bytes(),
+                    command: terraris::protocol::vless::wire::Command::Tcp,
+                    target: Some(Address::from_socket(target).unwrap()),
+                }
+                .write(&mut stream)
+                .await
+                .unwrap();
+                stream.write_all(b"first payload").await.unwrap();
+                stream.flush().await.unwrap();
+                let mut response = [0; 15];
+                ctx()
+                    .run(stream.read_exact(&mut response))
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "{mode}/{alpn}: {e:?}; {}",
+                            std::fs::read_to_string(&log).unwrap()
+                        )
+                    })
+                    .unwrap();
+                assert_eq!(&response[..2], &[0, 0]);
+                assert_eq!(&response[2..], b"first payload");
+                exchange(&mut stream, &[91; 65536]).await;
+                drop(stream);
+            }
+            connector.close(&ctx()).await.unwrap();
+            assert_eq!(budget.snapshot().used().bytes(), 0);
+            child.start_kill().unwrap();
+            child.wait().await.unwrap();
+            echo.abort();
+            echo.await.ok();
+        }
+    }
+}
+async fn xray_process(
+    value: &Value,
+    directory: &std::path::Path,
+    log: &std::path::Path,
+) -> tokio::process::Child {
+    let file = directory.join("xray-config.json");
+    std::fs::write(&file, serde_json::to_vec(value).unwrap()).unwrap();
+    let mut child =
+        tokio::process::Command::new(std::env::var("TERRARIS_XRAY").expect("Xray binary"))
+            .args(["run", "-c"])
+            .arg(file)
+            .stdout(std::fs::File::create(log).unwrap())
+            .stderr(std::fs::OpenOptions::new().append(true).open(log).unwrap())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+    let start = tokio::time::Instant::now();
+    loop {
+        let output = std::fs::read_to_string(log).unwrap();
+        if output.contains("started") {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5) && child.try_wait().unwrap().is_none(),
+            "{output}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    child
+}
+
+fn xhttp_obfuscated(data: &str) -> Value {
+    json!({"scMinPostsIntervalMs":1,"scMaxEachPostBytes":8192,"serverMaxHeaderBytes":32768,
+        "sessionIDPlacement":"cookie","sessionIDKey":"sid","seqPlacement":"header","seqKey":"X-Part",
+        "sessionIDTable":"hex","sessionIDLength":24,"uplinkDataPlacement":data,
+        "uplinkHTTPMethod":"GET","uplinkChunkSize":512,
+        "xPaddingObfsMode":true,"xPaddingPlacement":"query","xPaddingMethod":"tokenish","xPaddingBytes":"100-200",
+        "noGRPCHeader":true,"noSSEHeader":true,"xmux":{"maxConnections":1,"hMaxRequestTimes":4}})
+}
+async fn vless_over_transport(
+    connector: &Arc<dyn terraris::transport::Outbound>,
+    addresses: &[SocketAddr],
+    scope: &BufferScope,
+    target: SocketAddr,
+) -> Stream {
+    let (mut stream, _) = ctx()
+        .run(connector.connect(addresses, scope, &ctx()))
+        .await
+        .unwrap()
+        .unwrap();
+    terraris::protocol::vless::wire::Request {
+        uuid: *uuid::Uuid::parse_str(PASSWORD).unwrap().as_bytes(),
+        command: terraris::protocol::vless::wire::Command::Tcp,
+        target: Some(Address::from_socket(target).unwrap()),
+    }
+    .write(&mut stream)
+    .await
+    .unwrap();
+    let mut response = [0; 2];
+    ctx()
+        .run(stream.read_exact(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response, [0, 0]);
+    stream
+}
+#[tokio::test]
+async fn xhttp_header_cookie_uploads_and_h3_address_fallback() {
+    for alpn in ["http/1.1", "h2", "h3"] {
+        for placement in ["header", "cookie"] {
+            let extra = xhttp_obfuscated(placement);
+            let h = Harness::with_xhttp_options(
+                "vless",
+                "splithttp",
+                true,
+                Some(("packet-up", alpn, extra.clone())),
+            )
+            .await;
+            let connector = transport_connector_extra(
+                h.cert.clone(),
+                h.address,
+                "splithttp",
+                true,
+                0,
+                Some(("packet-up", alpn, extra)),
+            )
+            .await;
+            let (budget, scope) = resources();
+            let (target, echo) = echo().await;
+            let unavailable = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addresses = if alpn == "h3" {
+                vec![unavailable.local_addr().unwrap(), h.address]
+            } else {
+                vec![h.address]
+            };
+            let mut stream = vless_over_transport(&connector, &addresses, &scope, target).await;
+            let payload = (0..32 * 1024).map(|n| (n * 71) as u8).collect::<Vec<_>>();
+            exchange(&mut stream, &payload).await;
+            drop(stream);
+            connector.close(&ctx()).await.unwrap();
+            assert!(connector.idle());
+            assert_eq!(budget.snapshot().used().bytes(), 0);
+            h.close().await;
+            echo.abort();
+            echo.await.ok();
+        }
+    }
+}
+#[tokio::test]
+async fn xhttp_split_download_and_generation_refresh_preserve_sessions_until_revocation() {
+    let extra = json!({"scMinPostsIntervalMs":1,"scMaxEachPostBytes":8192,"xmux":{"maxConnections":1,"hMaxRequestTimes":2}});
+    let h = Harness::with_xhttp_options(
+        "vless",
+        "xhttp",
+        true,
+        Some(("packet-up", "", extra.clone())),
+    )
+    .await;
+    // A second ingress address forwards to the same backend session table. Its
+    // independent client negotiates HTTP/1.1 while uploads use HTTP/2.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let download = listener.local_addr().unwrap();
+    let address = h.address;
+    let forward = tokio::spawn(async move {
+        let mut jobs = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                accepted=listener.accept()=>{let(mut a,_)=accepted.unwrap();jobs.spawn(async move{let mut b=TcpStream::connect(address).await.unwrap();let _=tokio::io::copy_bidirectional(&mut a,&mut b).await;});},
+                _=jobs.join_next(),if !jobs.is_empty()=>{}
+            }
+        }
+    });
+    let mut client_extra = extra.clone();
+    client_extra["downloadSettings"] = json!({"address":"localhost","port":download.port(),"network":"splithttp","security":"tls","tlsSettings":{"serverName":"localhost","alpn":["http/1.1"]},"splithttpSettings":{"host":"localhost","path":"/relay","mode":"packet-up","extra":extra}});
+    let connector = transport_connector_extra(
+        h.cert.clone(),
+        h.address,
+        "xhttp",
+        true,
+        0,
+        Some(("packet-up", "h2", client_extra)),
+    )
+    .await;
+    let (budget, scope) = resources();
+    let (target, echo) = echo().await;
+    let mut stream = vless_over_transport(&connector, &[h.address], &scope, target).await;
+    exchange(&mut stream, b"before refresh").await;
+    let mut next = web_config("vless", h.address, "xhttp");
+    next["data"]["traffic_report_threshold"] = json!(2048);
+    let p = &mut next["data"]["protocols"][0];
+    p["xhttp_mode"] = json!("packet-up");
+    p["xhttp_extra"] = json!(extra.to_string());
+    h.panel.push(Reply::json(next));
+    h.panel.push(Reply::json(users()));
+    h.supervisor.sync_config(&ctx()).await.unwrap();
+    for i in 0..5 {
+        exchange(&mut stream, format!("after refresh {i}").as_bytes()).await;
+    }
+    let mut fresh = vless_over_transport(&connector, &[h.address], &scope, target).await;
+    exchange(&mut fresh, b"new session").await;
+    h.panel.push(Reply::json(json!({"users":[]})));
+    h.supervisor
+        .runtime(&ProtocolName::new("vless").unwrap())
+        .unwrap()
+        .controller
+        .sync_users(&ctx())
+        .await
+        .unwrap();
+    assert!(ctx().run(stream.read_u8()).await.unwrap().is_err());
+    assert!(ctx().run(fresh.read_u8()).await.unwrap().is_err());
+    drop(stream);
+    drop(fresh);
+    connector.close(&ctx()).await.unwrap();
+    assert!(connector.idle());
+    assert_eq!(budget.snapshot().used().bytes(), 0);
+    h.close().await;
+    forward.abort();
+    forward.await.ok();
+    echo.abort();
+    echo.await.ok();
+}
+
+fn xhttp_interop_cases() -> Vec<(&'static str, Value)> {
+    let defaults = json!({"scMinPostsIntervalMs":1,"scMaxEachPostBytes":65536,"xmux":{"maxConnections":1,"hMaxRequestTimes":5}});
+    let mut cases = ["auto", "packet-up", "stream-up", "stream-one"]
+        .into_iter()
+        .map(|m| (m, defaults.clone()))
+        .collect::<Vec<_>>();
+    cases.push(("packet-up", xhttp_obfuscated("header")));
+    cases.push(("packet-up", xhttp_obfuscated("cookie")));
+    cases
 }

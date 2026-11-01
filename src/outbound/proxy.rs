@@ -34,7 +34,7 @@ pub struct Proxy {
     user: String,
     password: Secret,
     uuid: Option<[u8; 16]>,
-    transport: Arc<dyn crate::transport::Outbound>,
+    pub(super) transport: Arc<dyn crate::transport::Outbound>,
     encryption: Option<Arc<encryption::Client>>,
     pub(crate) uot: Option<crate::protocol::uot::Version>,
     system: Arc<System>,
@@ -66,7 +66,10 @@ impl Proxy {
                 .map_err(|_| Error::Configuration("proxy hostname"))?;
         }
         let mut transport_config = config.clone();
-        if kind == Kind::Http && config.security == "tls" {
+        if kind == Kind::Http
+            && config.security == "tls"
+            && matches!(config.transport.as_str(), "" | "tcp" | "raw")
+        {
             if config.alpn.iter().any(|value| value != "http/1.1") {
                 return Err(Error::Unsupported);
             }
