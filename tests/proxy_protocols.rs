@@ -2000,3 +2000,76 @@ fn xhttp_interop_cases() -> Vec<(&'static str, Value)> {
     cases.push(("packet-up", xhttp_obfuscated("cookie")));
     cases
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn xhttp_default_packet_posts_sustain_sixteen_concurrent_streams() {
+    for alpn in ["h2", "h3"] {
+        for extra in [
+            json!({}),
+            json!({"xmux":{"maxConnections":1,"hMaxRequestTimes":8}}),
+        ] {
+            eprintln!("default packet-up 16 flows: {alpn}");
+            let h = Harness::with_xhttp_options(
+                "vless",
+                "xhttp",
+                true,
+                Some(("packet-up", alpn, extra.clone())),
+            )
+            .await;
+            let connector = transport_connector_extra(
+                h.cert.clone(),
+                h.address,
+                "xhttp",
+                true,
+                0,
+                Some(("packet-up", alpn, extra.clone())),
+            )
+            .await;
+            // One shared default connection scope, including all upload pipes and
+            // in-flight HTTP/QUIC body leases for the sixteen outbound streams.
+            let budget = Budget::new(Limits::new(4 << 20, 256).unwrap());
+            let scope = BufferScope::new(budget.root_scope(), 128 << 10).unwrap();
+            let (target, echo) = echo().await;
+            let mut flows = Vec::new();
+            for _ in 0..16 {
+                flows.push(vless_over_transport(&connector, &[h.address], &scope, target).await);
+            }
+            let mut jobs = tokio::task::JoinSet::new();
+            for (id, stream) in flows.into_iter().enumerate() {
+                jobs.spawn(async move {
+                    let (mut reader, mut writer) = tokio::io::split(stream);
+                    let send = async {
+                        let data = vec![id as u8; 65536];
+                        for _ in 0..64 {
+                            writer.write_all(&data).await.unwrap();
+                        }
+                    };
+                    let receive = async {
+                        let mut data = vec![0; 65536];
+                        for n in 0..64 {
+                            reader.read_exact(&mut data).await.unwrap();
+                            assert!(data.iter().all(|v| *v == id as u8));
+                            if n % 8 == 0 {
+                                tokio::task::yield_now().await;
+                            }
+                        }
+                    };
+                    tokio::join!(send, receive);
+                });
+            }
+            tokio::time::timeout(Duration::from_secs(20), async {
+                while let Some(r) = jobs.join_next().await {
+                    r.unwrap();
+                }
+            })
+            .await
+            .unwrap();
+            connector.close(&ctx()).await.unwrap();
+            assert!(connector.idle());
+            assert_eq!(budget.snapshot().used().bytes(), 0);
+            h.close().await;
+            echo.abort();
+            echo.await.ok();
+        }
+    }
+}

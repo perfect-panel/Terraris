@@ -139,6 +139,7 @@ pub async fn server(
     let (send, recv) = tokio::sync::mpsc::channel(crate::transport::MAX_MULTIPLEX_STREAMS);
     let service = Service {
         shared,
+        uploads: super::queue::Storage::new(scope.clone()),
         scope,
         streams: send,
         activity: activity.clone(),

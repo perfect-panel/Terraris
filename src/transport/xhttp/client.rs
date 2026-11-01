@@ -268,7 +268,7 @@ impl Outbound for Client {
                 let request = self
                     .config
                     .request(&self.authority, secure, &id, None, true, None)?
-                    .map(|_| body::ReadBody::boxed(input, scope.clone()));
+                    .map(|_| body::PipeBody::boxed(input));
                 let request = stream_request(&self.upload, request);
                 let open = self
                     .upload
@@ -427,6 +427,7 @@ async fn upload_packets(
         FuturesUnordered::<Pin<Box<dyn Future<Output = Result<(), Error>> + Send>>>::new();
     let mut sequence = 0u64;
     let mut last = None;
+    let mut carry = None;
     loop {
         while requests.len() >= config.sc_max_buffered_posts {
             requests.next().await.expect("pending upload")?;
@@ -454,7 +455,7 @@ async fn upload_packets(
                 "XHTTP payload headers exceed header limit",
             ));
         }
-        let read = read_packet(&mut input, &scope, max);
+        let read = read_packet(&mut input, &mut carry, max);
         tokio::pin!(read);
         let packet = loop {
             tokio::select! {biased;r=requests.next(),if !requests.is_empty()=>{r.expect("pending request")?;},packet=&mut read=>break packet?}
@@ -504,6 +505,7 @@ async fn upload_packets(
                     .map_err(|_| Error::Configuration("XHTTP length"))?,
             );
             let body = http_body_util::StreamBody::new(stream).boxed_unsync();
+            let (body, mut submitted) = body::submitted(body, len);
             let request = req.map(|_| body);
             let context = OperationContext::new(
                 cancel.clone(),
@@ -515,11 +517,26 @@ async fn upload_packets(
             let open = manager
                 .open(&mut lease, &addresses, &scope, &context, request)
                 .await?;
-            requests.push(packet_result(open.response, context));
+            requests.push(packet_result(open.response, context.clone()));
             sequence = sequence
                 .checked_add(1)
                 .ok_or(Error::Configuration("XHTTP sequence overflow"))?;
             last = Some(tokio::time::Instant::now());
+            // Match Polaris's onWritten pacing: responses remain pipelined,
+            // while each session submits its bodies in sequence. Otherwise
+            // later uploads can occupy the shared HTTP receive window and
+            // prevent the head packet from completing under backpressure.
+            context.run(async {
+            loop {
+                tokio::select! {
+                    biased;
+                    result = requests.next(), if !requests.is_empty() => result.expect("pending upload")?,
+                    result = &mut submitted => {
+                        return result.map_err(|_| Error::Io(io::ErrorKind::ConnectionAborted));
+                    }
+                }
+            }
+            }).await.map_err(Error::Stopped)??;
             continue;
         };
         let context = OperationContext::new(
@@ -563,33 +580,41 @@ fn packet_result(
 }
 async fn read_packet(
     input: &mut Pipe,
-    scope: &BufferScope,
+    carry: &mut Option<Bytes>,
     max: usize,
 ) -> Result<Option<Vec<Bytes>>, Error> {
     let mut chunks = Vec::new();
     let mut size = 0;
     let mut deadline = None;
     while size < max {
-        let mut buffer = scope
-            .try_lease(BufferLayout::new(0, (max - size).min(16384), 0).map_err(io::Error::other)?)
-            .map_err(io::Error::other)?;
         let read = poll_fn(|cx| {
-            buffer.poll_payload(cx, |cx, out| Pin::new(&mut *input).poll_read(cx, out))
+            if let Some(bytes) = carry.take() {
+                Poll::Ready(Some(bytes))
+            } else {
+                input
+                    .poll_read_chunk(cx)
+                    .map(|buffer| buffer.map(Bytes::from_owner))
+            }
         });
-        let result = if let Some(deadline) = deadline {
+        let next = if let Some(deadline) = deadline {
             match tokio::time::timeout_at(deadline, read).await {
-                Ok(v) => v,
+                Ok(value) => value,
                 Err(_) => break,
             }
         } else {
             read.await
         };
-        let (_, n) = result?;
-        if n == 0 {
+        let Some(mut bytes) = next else {
             break;
+        };
+        let count = (max - size).min(bytes.len());
+        if count < bytes.len() {
+            chunks.push(bytes.split_to(count));
+            *carry = Some(bytes);
+        } else {
+            chunks.push(bytes);
         }
-        size += n;
-        chunks.push(Bytes::from_owner(buffer));
+        size += count;
         if deadline.is_none() {
             deadline = Some(tokio::time::Instant::now() + Duration::from_millis(1));
         }
@@ -609,4 +634,44 @@ fn stream_request<B>(manager: &Manager, mut request: http::Request<B>) -> http::
         );
     }
     request
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::resource::{Budget, Limits};
+    use tokio::io::AsyncWriteExt;
+    #[tokio::test]
+    async fn packetizer_transfers_existing_lease_and_preserves_split_tail_at_full_budget() {
+        let memory = Budget::new(Limits::new(16384, 1).unwrap());
+        let scope = BufferScope::new(memory.root_scope(), 16384).unwrap();
+        let (mut writer, mut reader) = crate::network::pipe::pair(scope, 2).unwrap();
+        writer.write_all(b"abcdefgh").await.unwrap();
+        writer.shutdown().await.unwrap();
+        let mut carry = None;
+        let first = read_packet(&mut reader, &mut carry, 3)
+            .await
+            .unwrap()
+            .unwrap();
+        let second = read_packet(&mut reader, &mut carry, 3)
+            .await
+            .unwrap()
+            .unwrap();
+        let third = read_packet(&mut reader, &mut carry, 3)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.concat(), b"abc");
+        assert_eq!(second.concat(), b"def");
+        assert_eq!(third.concat(), b"gh");
+        assert!(
+            read_packet(&mut reader, &mut carry, 3)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(memory.snapshot().used().allocations(), 1);
+        drop((first, second, third));
+        assert_eq!(memory.snapshot().used().bytes(), 0);
+    }
 }

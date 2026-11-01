@@ -91,6 +91,7 @@ pub struct Budget {
 struct Inner {
     limits: Limits,
     state: Mutex<State>,
+    changed: tokio::sync::Notify,
 }
 
 #[derive(Default)]
@@ -112,6 +113,7 @@ impl Budget {
             inner: Arc::new(Inner {
                 limits,
                 state: Mutex::default(),
+                changed: tokio::sync::Notify::new(),
             }),
         }
     }
@@ -186,6 +188,10 @@ impl Node {
 }
 
 impl Scope {
+    /// Register before checking capacity so a concurrent release cannot be lost.
+    pub(crate) fn capacity_changed(&self) -> &tokio::sync::Notify {
+        &self.inner.changed
+    }
     pub fn limits(&self) -> Limits {
         self.node.as_ref().map_or(self.inner.limits, |n| n.limits)
     }
@@ -246,6 +252,8 @@ impl Scope {
         } else {
             state.closed = true;
         }
+        drop(state);
+        self.inner.changed.notify_waiters();
     }
 
     /// A zero-byte request still occupies one allocation slot.
@@ -510,6 +518,8 @@ impl Drop for Charge {
                 node.set_usage(reserved, resident);
             }
         }
+        drop(state);
+        self.scope.inner.changed.notify_waiters();
     }
 }
 

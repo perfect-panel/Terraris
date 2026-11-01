@@ -10,7 +10,7 @@ use crate::{buffer::BufferScope, network::Stream, task::CancellationToken, trans
 use http::{Request, Response};
 use http_body_util::BodyExt;
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::BTreeMap,
     convert::Infallible,
     future::Future,
     pin::Pin,
@@ -169,6 +169,7 @@ impl Drop for CancelSession {
 pub struct Service {
     pub shared: Arc<Shared>,
     pub scope: BufferScope,
+    pub uploads: Arc<queue::Storage>,
     pub streams: mpsc::Sender<Stream>,
     pub activity: Arc<Activity>,
 }
@@ -217,7 +218,7 @@ impl Service {
         }
         r
     }
-    async fn serve(&self, req: &Request<()>, mut body: Body) -> Result<Body, u16> {
+    async fn serve(&self, req: &Request<()>, body: Body) -> Result<Body, u16> {
         let c = &self.shared.config;
         if req
             .headers()
@@ -293,40 +294,57 @@ impl Service {
                 } else {
                     encoded.len()
                 };
-                let mut reservation = s.reserve(sequence, capacity).await?;
-                let mut chunks = VecDeque::new();
-                let mut size = encoded.len();
-                for chunk in encoded.chunks(16384) {
-                    chunks.push_back(body::copy(&self.scope, chunk).map_err(|_| 503u16)?);
+                if capacity > c.sc_max_each_post_bytes.to {
+                    return Err(413);
                 }
-                if has_body {
-                    let read = async {
-                        while let Some(frame) = body.frame().await {
-                            let frame = frame.map_err(|_| 400u16)?;
-                            if let Ok(data) = frame.into_data() {
-                                size = size.checked_add(data.len()).ok_or(413u16)?;
-                                if size > capacity {
-                                    return Err(413u16);
-                                }
-                                for chunk in data.chunks(16384) {
-                                    chunks.push_back(
-                                        body::copy(&self.scope, chunk).map_err(|_| 503u16)?,
-                                    );
-                                }
+                let Some(writer) = s.begin(sequence)? else {
+                    return Ok(body::empty());
+                };
+                let receive = async {
+                    use tokio::io::AsyncReadExt;
+                    let input = if has_body { body } else { body::empty() };
+                    let mut input = std::io::Cursor::new(encoded).chain(body::Reader::new(input));
+                    let mut size = 0;
+                    while size < capacity {
+                        let count = self.uploads.block_size.min(capacity - size);
+                        let mut chunk = writer.allocate(&self.uploads, count).await?;
+                        let mut limited = (&mut input).take(count as u64);
+                        while chunk.buffer.len() < count {
+                            if chunk
+                                .buffer
+                                .read_from(&mut limited)
+                                .await
+                                .map_err(|_| 400u16)?
+                                == 0
+                            {
+                                break;
                             }
                         }
-                        Ok::<_, u16>(())
-                    };
-                    tokio::select! {_=s.closed.cancelled()=>return Err(409),r=tokio::time::timeout(Duration::from_secs(30),read)=>r.map_err(|_|408u16)??};
+                        let n = chunk.buffer.len();
+                        size += n;
+                        if n != 0 {
+                            writer.push(chunk)?;
+                        }
+                        if n < count {
+                            break;
+                        }
+                    }
+                    // Probe beyond an unknown-length body's limit without allocating
+                    // another block. A truncated/oversized request closes the session
+                    // through Writer's guard, even if its prefix was consumed.
+                    let mut probe = [0];
+                    if input.read(&mut probe).await.map_err(|_| 400u16)? != 0 {
+                        return Err(413);
+                    }
+                    if has_body && content_length.is_some() && size != capacity {
+                        return Err(400);
+                    }
+                    writer.finish()
+                };
+                tokio::select! {
+                    _ = s.closed.cancelled() => return Err(409),
+                    result = tokio::time::timeout(Duration::from_secs(30), receive) => result.map_err(|_| 408u16)??,
                 }
-                reservation.shrink(size);
-                s.push(
-                    sequence,
-                    queue::Packet {
-                        chunks,
-                        _reservation: reservation,
-                    },
-                )?;
                 return Ok(body::empty());
             }
             s.upload(body)?;
@@ -461,6 +479,7 @@ pub fn tcp(
     let (send, recv) = mpsc::channel(crate::transport::MAX_MULTIPLEX_STREAMS);
     let service = Service {
         shared: shared.clone(),
+        uploads: queue::Storage::new(scope.clone()),
         scope,
         streams: send,
         activity: activity.clone(),
@@ -510,6 +529,7 @@ mod tests {
         let (send, mut streams) = mpsc::channel(2);
         let service = Service {
             shared: shared.clone(),
+            uploads: queue::Storage::new(scope.clone()),
             scope,
             streams: send,
             activity: Activity::new(),
@@ -567,5 +587,79 @@ mod tests {
         shared.release();
         shared.close_if_unused().await;
         assert!(shared.jobs.idle());
+    }
+}
+
+#[cfg(test)]
+mod pressure_tests {
+    use super::*;
+    use crate::{
+        buffer::{BufferPool, PoolConfig},
+        resource::{Budget, Limits},
+    };
+    #[tokio::test]
+    async fn default_megabyte_post_in_tiny_http_frames_uses_compact_blocks() {
+        let config = Config::parse("localhost", "/relay", "packet-up", "{}").unwrap();
+        let shared = Shared::new(config).unwrap();
+        shared.retain();
+        let memory = Budget::new(Limits::new(64 << 20, 16384).unwrap());
+        let pool =
+            BufferPool::new(memory.clone(), PoolConfig::standard(16 << 20, 4096, 64)).unwrap();
+        let scope = pool
+            .scope(
+                memory.scope(Limits::new(4 << 20, 256).unwrap()).unwrap(),
+                128 << 10,
+            )
+            .unwrap();
+        let (send, _streams) = mpsc::channel(2);
+        let service = Service {
+            shared: shared.clone(),
+            uploads: queue::Storage::new(scope.clone()),
+            scope: scope.clone(),
+            streams: send,
+            activity: Activity::new(),
+        };
+        let frames = futures_util::stream::unfold(0, |offset| async move {
+            if offset == 1_000_000 {
+                None
+            } else {
+                let n = 137.min(1_000_000 - offset);
+                Some((
+                    Ok::<_, std::io::Error>(http_body::Frame::data(bytes::Bytes::from(vec![
+                        71;
+                        n
+                    ]))),
+                    offset + n,
+                ))
+            }
+        });
+        let mut request = shared
+            .config
+            .request("localhost", false, "fragmented", Some(0), true, None)
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("content-length", "1000000".parse().unwrap());
+        let response = service
+            .handle(
+                request.map(|_| http_body_util::StreamBody::new(Box::pin(frames)).boxed_unsync()),
+            )
+            .await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(scope.snapshot().used().allocations(), 16);
+        assert_eq!(scope.snapshot().used().bytes(), 1 << 20);
+        let session = shared.session("fragmented", false).unwrap();
+        let mut reader = session.reader();
+        let mut data = vec![0; 1_000_000];
+        tokio::io::AsyncReadExt::read_exact(&mut reader, &mut data)
+            .await
+            .unwrap();
+        assert!(data.iter().all(|v| *v == 71));
+        drop(reader);
+        shared.release();
+        shared.close_if_unused().await;
+        assert_eq!(scope.snapshot().used().bytes(), 0);
+        pool.close();
+        assert_eq!(memory.snapshot().used().bytes(), 0);
     }
 }

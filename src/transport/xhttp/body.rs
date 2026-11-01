@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 // XHTTP body adapters. Payload ownership stays with Terraris buffer leases.
 use crate::{
-    buffer::{BufferLayout, BufferLease, BufferScope},
+    buffer::BufferScope,
     network::{Stream, pipe::Pipe},
 };
 use bytes::{Buf, Bytes};
@@ -21,13 +21,6 @@ pub fn empty() -> Body {
 }
 pub fn incoming(body: hyper::body::Incoming) -> Body {
     body.map_err(io::Error::other).boxed_unsync()
-}
-pub fn copy(scope: &BufferScope, data: &[u8]) -> io::Result<Bytes> {
-    let mut lease = scope
-        .try_lease(BufferLayout::new(0, data.len(), 0).map_err(io::Error::other)?)
-        .map_err(io::Error::other)?;
-    lease.append_payload(data).map_err(io::Error::other)?;
-    Ok(Bytes::from_owner(lease))
 }
 pub struct Reader {
     body: Body,
@@ -74,60 +67,38 @@ impl AsyncRead for Reader {
         }
     }
 }
-pub struct ReadBody<R> {
-    reader: R,
-    scope: BufferScope,
-    buffer: Option<BufferLease>,
+/// HTTP takes the queued Pipe lease directly. QUIC may retain these bytes
+/// until acknowledgement, so forwarding must wait for capacity, not copy into
+/// another allocation and fail when the shared scope is temporarily full.
+pub struct PipeBody {
+    reader: Pipe,
     done: bool,
 }
-impl<R: AsyncRead + Unpin + Send + 'static> ReadBody<R> {
-    pub fn boxed(reader: R, scope: BufferScope) -> Body {
+impl PipeBody {
+    pub fn boxed(reader: Pipe) -> Body {
         Self {
             reader,
-            scope,
-            buffer: None,
             done: false,
         }
         .boxed_unsync()
     }
 }
-impl<R: AsyncRead + Unpin> HttpBody for ReadBody<R> {
+impl HttpBody for PipeBody {
     type Data = Bytes;
     type Error = io::Error;
     fn poll_frame(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
-        let this = &mut *self;
-        if this.done {
+        if self.done {
             return Poll::Ready(None);
         }
-        if this.buffer.is_none() {
-            this.buffer = Some(
-                this.scope
-                    .try_lease(BufferLayout::new(0, 16384, 0).map_err(io::Error::other)?)
-                    .map_err(io::Error::other)?,
-            );
-        }
-        let (_, n) = match ready!(
-            this.buffer
-                .as_mut()
-                .expect("allocated buffer")
-                .poll_payload(cx, |cx, out| Pin::new(&mut this.reader).poll_read(cx, out))
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                this.done = true;
-                this.buffer = None;
-                return Poll::Ready(Some(Err(e)));
+        match ready!(self.reader.poll_read_chunk(cx)) {
+            Some(buffer) => Poll::Ready(Some(Ok(Frame::data(Bytes::from_owner(buffer))))),
+            None => {
+                self.done = true;
+                Poll::Ready(None)
             }
-        };
-        let buffer = this.buffer.take().expect("allocated buffer");
-        if n == 0 {
-            this.done = true;
-            Poll::Ready(None)
-        } else {
-            Poll::Ready(Some(Ok(Frame::data(Bytes::from_owner(buffer)))))
         }
     }
     fn is_end_stream(&self) -> bool {
@@ -187,7 +158,7 @@ impl<G: Send + Unpin + 'static> HttpBody for Guarded<G> {
 }
 pub fn response_pipe(scope: &BufferScope) -> io::Result<(Pipe, Body)> {
     let (a, b) = crate::network::pipe::pair(scope.clone(), 4)?;
-    Ok((a, ReadBody::boxed(b, scope.clone())))
+    Ok((a, PipeBody::boxed(b)))
 }
 pub struct OwnedStream<G: Send + Unpin> {
     pub io: Stream,
@@ -211,5 +182,113 @@ impl<G: Send + Unpin> AsyncWrite for OwnedStream<G> {
     }
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().io).poll_shutdown(cx)
+    }
+}
+
+/// Signals when the HTTP driver has consumed the final upload DATA frame.
+/// A client may pipeline responses, but must not queue arbitrarily many later
+/// packet bodies ahead of an earlier packet on the same HTTP connection.
+pub fn submitted(body: Body, bytes: usize) -> (Body, tokio::sync::oneshot::Receiver<()>) {
+    let (send, receive) = tokio::sync::oneshot::channel();
+    (
+        Submitted {
+            body,
+            remaining: bytes,
+            send: Some(send),
+        }
+        .boxed_unsync(),
+        receive,
+    )
+}
+struct Submitted {
+    body: Body,
+    remaining: usize,
+    send: Option<tokio::sync::oneshot::Sender<()>>,
+}
+impl HttpBody for Submitted {
+    type Data = Bytes;
+    type Error = io::Error;
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
+        let frame = ready!(Pin::new(&mut self.body).poll_frame(cx));
+        match &frame {
+            Some(Ok(frame)) => {
+                if let Some(data) = frame.data_ref() {
+                    self.remaining = self.remaining.saturating_sub(data.len());
+                }
+                if self.remaining == 0
+                    && let Some(send) = self.send.take()
+                {
+                    let _ = send.send(());
+                }
+            }
+            None => {
+                if self.remaining == 0
+                    && let Some(send) = self.send.take()
+                {
+                    let _ = send.send(());
+                } else {
+                    self.send = None;
+                }
+            }
+            Some(Err(_)) => self.send = None,
+        }
+        Poll::Ready(frame)
+    }
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.body.size_hint()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn http_body_transfers_the_only_buffer_without_a_second_allocation() {
+        use crate::resource::{Budget, Limits};
+        use tokio::io::AsyncWriteExt;
+        let memory = Budget::new(Limits::new(16384, 1).unwrap());
+        let scope = BufferScope::new(memory.root_scope(), 16384).unwrap();
+        let (mut writer, reader) = crate::network::pipe::pair(scope, 1).unwrap();
+        let mut body = PipeBody::boxed(reader);
+        writer.write_all(b"direct ownership").await.unwrap();
+        let frame = body.frame().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(frame.as_ref(), b"direct ownership");
+        assert_eq!(memory.snapshot().used().allocations(), 1);
+        assert_eq!(memory.snapshot().used().bytes(), 16);
+        drop(frame);
+        writer.shutdown().await.unwrap();
+        assert!(body.frame().await.is_none());
+        assert_eq!(memory.snapshot().used().bytes(), 0);
+    }
+    #[tokio::test]
+    async fn submission_tracks_the_last_frame_and_does_not_ack_truncation_or_drop() {
+        fn frames() -> Body {
+            http_body_util::StreamBody::new(futures_util::stream::iter([
+                Ok::<_, io::Error>(Frame::data(Bytes::from_static(b"one!"))),
+                Ok(Frame::data(Bytes::from_static(b"two!"))),
+            ]))
+            .boxed_unsync()
+        }
+        let (mut body, mut done) = submitted(frames(), 8);
+        body.frame().await.unwrap().unwrap();
+        assert!(matches!(
+            done.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        body.frame().await.unwrap().unwrap();
+        assert_eq!(done.await, Ok(()));
+        let (mut body, done) = submitted(frames(), 9);
+        while body.frame().await.is_some() {}
+        assert!(done.await.is_err());
+        let (mut body, done) = submitted(frames(), 8);
+        body.frame().await.unwrap().unwrap();
+        drop(body);
+        assert!(done.await.is_err());
     }
 }

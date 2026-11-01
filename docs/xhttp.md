@@ -70,7 +70,7 @@ header/cookie 上传还受头部预算限制，出站会缩小实际分片，入
 
 `xmux` 支持 `maxConcurrency`、`maxConnections`、`cMaxReuseTimes`、`hMaxRequestTimes`、`hMaxReusableSecs`、`hKeepAlivePeriod`。全部为零时采用 Polaris 默认：3 个连接组、每组 600–900 次 HTTP 请求、1800–3000 秒可复用时间。`maxConnections` 与 `maxConcurrency` 不能同时非零；上限分别为 128 和 1024。
 
-池按不可变出站配置隔离，逻辑连接组可以包含多条 HTTP/1.1 socket；每组最多 64 条物理连接，每条 HTTP/2/3 连接最多 64 个活跃请求。复用次数、请求数或时间耗尽后轮换；旧请求保留各自租约。只复用当前 DNS 候选仍包含实际对端的连接，空闲物理连接 300 秒后回收。失败不重放已发送的请求体。HTTP/3 对最多 64 个解析候选进行最多 4 路错峰尝试，每次握手最多 3 秒，总过程仍受调用方截止时间约束。
+池按不可变出站配置隔离，逻辑连接组可以包含多条 HTTP/1.1 socket；每组最多 64 条物理连接，每条 HTTP/2/3 连接最多 64 个活跃请求。复用次数、请求数或时间耗尽后轮换；旧请求保留各自租约。连接组选择与请求名额扣减在同一临界区内完成，避免并发轮换误判为连接关闭。只复用当前 DNS 候选仍包含实际对端的连接，空闲物理连接 300 秒后回收。失败不重放已发送的请求体。HTTP/3 对最多 64 个解析候选进行最多 4 路错峰尝试，每次握手最多 3 秒，总过程仍受调用方截止时间约束。
 
 出站 `downloadSettings` 可以指定独立地址、端口、TLS 和 XHTTP 参数。例如 `xhttp_extra` 解码后的内容：
 
@@ -92,7 +92,13 @@ header/cookie 上传还受头部预算限制，出站会缩小实际分片，入
 
 ## 生命周期与资源
 
-上传分片使用 BufferScope 存储，并同时计入会话/共享服务队列额度；乱序队列为缺失的首片预留空间，避免后续分片占满后阻塞重组。重复片不重复交付，空片推进序号但不表示 EOF。上传读取及额度等待最多 30 秒；未建立下载的孤立会话在 30 秒后回收。
+上传请求按最多 64 KiB 的块合并 HTTP DATA / QUIC 小片段，使用 BufferScope 存储，并计入会话/共享服务队列额度。当前序号的数据块可在整个 POST 结束前交给协议层，消费后立即归还缓冲；后续序号仍按序排队。默认 1 MB 上传最多需要 16 个合并后的块，不再为每个网络片段单独占用分配名额。
+
+每条物理载体的上传块最多占用其一半缓冲字节和分配名额，另一半供协议转发和下载使用。默认连接额度保持 4 MiB / 256 个名额，上传最多占 2 MiB（32 个 64 KiB 块）；后续序号还需给当前序号保留至少一个块。会话及共享队列另保留首片额度。临时额度不足时停止读取请求体，等待消费、预算释放或取消信号，通过 HTTP/QUIC 流控向上游施加背压，不因瞬时耗尽立即返回 503。关闭、永久不合法的资源需求和请求/会话数超限仍会失败。
+
+HTTP 发送方向直接转交管道中已有的 BufferLease，出站分片也通过共享字节视图保留跨片尾部；不再为发送每一块额外分配并复制缓冲。HTTP/QUIC 持有数据直到写出或确认期间，这些租约始终计入预算。管道写入遇到临时额度不足会等待释放；取消、对端关闭或预算关闭会结束等待。
+
+重复片不重复交付，空片推进序号但不表示 EOF。上传读取及额度等待合计最多 30 秒；未建立下载的孤立会话在 30 秒后回收。若请求中断、截断或超过声明/配置长度，关闭整个会话，避免已经交付的前缀与下一片拼接。出站等待当前请求体被 HTTP 驱动接收后再提交下一片，同时允许响应流水线并发，避免大量后续请求体堵住当前片的共享接收窗口。
 
 同一协议、端口和等价 XHTTP 参数的配置代次共享会话表，所以换用户快照、路由/报告配置或证书后，新建上传连接仍能找到旧会话。XHTTP 参数变化会产生新表，旧流按代次排空规则退出。每个逻辑流仍执行认证、当前用户撤销、限速、设备准入和 payload 计量。已有连接继续使用旧 TLS 身份，新 QUIC 握手在协议准入后使用当前代次身份。
 
@@ -100,7 +106,7 @@ header/cookie 上传还受头部预算限制，出站会缩小实际分片，入
 
 Quinn 使用固定接收窗口，**未复制 quic-go 的自动窗口增长**：实际流/连接窗口使用 `h3InitialStreamReceiveWindow` / `h3InitialConnectionReceiveWindow`，默认 512 KiB / 1 MiB。`h3MaxStreamReceiveWindow` / `h3MaxConnectionReceiveWindow` 默认 4 MiB / 16 MiB，用作配置上界检查，不会使运行窗口自动扩张；四个字段上限均为 1 GiB，连接窗口不得小于流窗口。需较大窗口时直接调高 initial 值。
 
-HTTP/TLS/QUIC 库内部缓冲和元数据遵守库与连接数量限制，不计入 payload BufferScope；节点字节预算不是进程 RSS 上限。自定义会话字母表比 Polaris 更严格，只接受字母、数字及 `-_.~`，避免路径/查询/Cookie 分隔符冲突。生产反向代理/CDN、跨地域丢包、长期负载及性能基准尚未验证。
+HTTP/TLS/QUIC 库另外分配的内部缓冲和元数据遵守库与连接数量限制，不计入 payload BufferScope；节点字节预算不是进程 RSS 上限。自定义会话字母表比 Polaris 更严格，只接受字母、数字及 `-_.~`，避免路径/查询/Cookie 分隔符冲突。生产反向代理/CDN、跨地域丢包及长期运行仍需独立验证；本机短时压力结果不能代替这些验证。
 
 ## 可复现验证
 
@@ -113,4 +119,21 @@ TERRARIS_XRAY=/tmp/terraris-xray \
   cargo test --locked --test proxy_protocols xhttp_clients_interoperate -- --ignored
 ```
 
-Polaris helper 从指定提交的独立临时 archive 构建，不修改源码 checkout。Xray 固定版本及构建方法见 [VLESS 文档](vless.md)。双向外部测试覆盖 `auto` 和三种模式，HTTP/1.1/2/3；Polaris 另覆盖明文 HTTP/1.1、自定义 header/cookie 上传、GET、元数据位置和 tokenish padding。普通测试覆盖分流下载、配置代次、撤销、地址回退、乱序和额度回收。所有互通均为本地真实网络进程配合模拟面板。
+Polaris helper 从指定提交的独立临时 archive 构建，不修改源码 checkout。Xray 固定版本及构建方法见 [VLESS 文档](vless.md)。双向外部测试覆盖 `auto` 和三种模式，HTTP/1.1/2/3；Polaris 另覆盖明文 HTTP/1.1、自定义 header/cookie 上传、GET、元数据位置和 tokenish padding。普通测试覆盖分流下载、配置代次、撤销、地址回退、乱序、1 MB 小片段上传、额度等待与取消、默认配置的 16 流传输和额度回收。所有互通均为本地真实网络进程配合模拟面板。
+
+### 默认配置持续压测
+
+可选脚本使用真实 release 节点、模拟面板、固定版本 Polaris 客户端及独立 TCP echo 进程。节点保持默认 64 MiB / 16384 名额、每连接 4 MiB / 256 名额，XHTTP extra 为 `{}`；仅缩短测试退出排空时间。默认各跑两轮 HTTP/2 和 HTTP/3：单连接 15 秒，16 并发 60 秒，另有 1 秒预热。每条流检查数据内容和每秒进展，任何异常 I/O、内容错误或连续 5 秒停顿都会使该轮失败。RSS 为节点进程每 200 ms 的采样值，吞吐仅统计收到的应用载荷，不叠加上下行。
+
+```sh
+cargo build --locked --release
+./tests/interop/xhttp/build.sh /path/to/Polaris /tmp/terraris-polaris-xhttp
+python3 tests/interop/xhttp/benchmark.py \
+  --node target/release/terraris \
+  --polaris /tmp/terraris-polaris-xhttp \
+  --output /tmp/terraris-xhttp-benchmark
+```
+
+输出目录必须为空；脚本写入结果/条件 JSON、节点日志及临时测试证书。也可用 `--alpn h3 --rounds 1` 单独复测。该同机回环测试不隔离后台负载，不代表跨地域、CDN 或生产容量。
+
+固定 Xray 测试版本 `a4a3dff5b20c` 在默认 HTTP/3 XMUX 轮换时，替换后的上传连接未持有相应 running/request 租约，可能主动关闭仍在传输的 QUIC 连接。此现象也在 Xray 客户端到同版本 Xray 服务端的 16 并发持续对照中复现。Polaris `56d52fb` 持有上传、下载和请求租约，因此持续压力脚本使用该客户端；现有固定 Xray 测试继续用于线协议互通，不能将它的短测结果作为默认配置长时间稳定性的证明。

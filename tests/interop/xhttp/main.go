@@ -55,7 +55,15 @@ func run() error {
 	cert := flag.String("cert", "", "PEM certificate")
 	key := flag.String("key", "", "PEM key")
 	extra := flag.String("extra", "{}", "XHTTP extra JSON")
+	duration := flag.Duration("duration", 0, "optional sustained benchmark duration")
+	concurrency := flag.Int("concurrency", 1, "benchmark concurrent sessions")
 	flag.Parse()
+	if *duration < 0 || *duration > time.Hour || *concurrency < 1 || *concurrency > 128 {
+		return fmt.Errorf("invalid benchmark limits")
+	}
+	if *role == "echo" {
+		return benchmarkEcho(*server)
+	}
 	cfg, err := xhttp.Parse("localhost", "/relay", *mode, *extra)
 	if err != nil {
 		return err
@@ -81,7 +89,11 @@ func run() error {
 			tlsConfig.RootCAs = roots
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	lifetime := 90 * time.Second
+	if *duration > 0 {
+		lifetime = *duration + 30*time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), lifetime)
 	defer cancel()
 	if *role == "server" {
 		s := xhttp.NewServer(ctx, cfg, tlsConfig, handler{})
@@ -145,6 +157,9 @@ func run() error {
 	header := append([]byte{0}, []byte{0xb8, 0x31, 0x38, 0x1d, 0x63, 0x24, 0x4d, 0x53, 0xad, 0x4f, 0x8c, 0xda, 0x48, 0xb3, 0x08, 0x11}...)
 	header = append(header, 0, 1, byte(n>>8), byte(n), 1)
 	header = append(header, ip...)
+	if *duration > 0 {
+		return benchmark(ctx, client.DialContext, header, *duration, *concurrency)
+	}
 	for i := 0; i < 3; i++ {
 		conn, err := client.DialContext(ctx)
 		if err != nil {

@@ -15,6 +15,29 @@ pub struct BufferScope {
 }
 
 impl BufferScope {
+    pub(crate) fn capacity_changed(&self) -> &tokio::sync::Notify {
+        self.resources.capacity_changed()
+    }
+    /// Internal I/O backpressure. The owning operation supplies cancellation
+    /// and a deadline; dropping this future leaves no pending reservation.
+    pub(crate) async fn lease_when_available(
+        &self,
+        layout: BufferLayout,
+    ) -> Result<BufferLease, Error> {
+        loop {
+            let changed = self.capacity_changed().notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            match self.try_lease(layout) {
+                Err(Error::Resource(crate::resource::Error::Exhausted {
+                    requested,
+                    limit,
+                    ..
+                })) if requested <= limit => changed.await,
+                result => return result,
+            }
+        }
+    }
     pub fn new(resources: Scope, max_allocation: usize) -> Result<Self, Error> {
         if max_allocation == 0 || max_allocation > isize::MAX as usize {
             return Err(Error::InvalidAllocationLimit);

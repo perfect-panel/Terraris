@@ -8,5 +8,5 @@ work_dir=$(mktemp -d "${TMPDIR:-/tmp}/terraris-polaris.XXXXXX")
 trap 'rm -rf -- "$work_dir"' EXIT
 git -C "$source_dir" archive "$revision" | tar -x -C "$work_dir"
 mkdir -p "$work_dir/test/terraris-interop"
-cp "$fixture_dir/main.go" "$work_dir/test/terraris-interop/main.go"
+cp "$fixture_dir/"*.go "$work_dir/test/terraris-interop/"
 (cd "$work_dir" && go build -mod=readonly -o "$output" ./test/terraris-interop)

@@ -124,10 +124,13 @@ impl Manager {
         }))
     }
     pub fn acquire(self: &Arc<Self>) -> Result<Lease, Error> {
+        let mut groups = self.groups.lock().unwrap_or_else(|e| e.into_inner());
+        self.acquire_locked(&mut groups)
+    }
+    fn acquire_locked(self: &Arc<Self>, groups: &mut Vec<Arc<Group>>) -> Result<Lease, Error> {
         if self.jobs.cancel.is_cancelled() {
             return Err(closed());
         }
-        let mut groups = self.groups.lock().unwrap_or_else(|e| e.into_inner());
         groups.retain(|g| {
             if !g.available() {
                 g.retired.store(true, Ordering::Release);
@@ -239,12 +242,7 @@ impl Manager {
         context: &OperationContext,
         request: Request<Body>,
     ) -> Result<Open, Error> {
-        if !lease.group.take_request() {
-            *lease = self.acquire()?;
-            if !lease.group.take_request() {
-                return Err(closed());
-            }
-        }
+        self.reserve_request(lease, context)?;
         let physical = self
             .connection(&lease.group, addresses, scope, context)
             .await?;
@@ -318,6 +316,24 @@ impl Manager {
                 Ok(response.map(|b| body::Guarded::boxed(b, guard)))
             }),
         })
+    }
+    fn reserve_request(
+        self: &Arc<Self>,
+        lease: &mut Lease,
+        context: &OperationContext,
+    ) -> Result<(), Error> {
+        // Selection and ticket consumption share one lock. With concurrent
+        // uploads, a replacement must not lose its last request between
+        // acquire() and take_request() and spuriously abort a healthy session.
+        let mut groups = self.groups.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            context.check().map_err(Error::Stopped)?;
+            if lease.group.take_request() {
+                return Ok(());
+            }
+            lease.group.retired.store(true, Ordering::Release);
+            *lease = self.acquire_locked(&mut groups)?;
+        }
     }
     async fn connection(
         self: &Arc<Self>,
