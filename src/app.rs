@@ -105,7 +105,7 @@ pub async fn run() -> Result<(), Error> {
                 "panel: ppanel (JSON, HTTP Protobuf, conditional GET, device leases, online/traffic/status reporting)"
             );
             println!(
-                "buffers: fixed capacity, hierarchical byte/slot budgets, atomic batch reservations (no cache)"
+                "buffers: fixed capacity, shared views, Bytes ownership, bounded cache and byte/message queues"
             );
             println!("proxy protocols: none (foundation stage)");
             println!("runtime: not implemented");

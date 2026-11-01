@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Exclusive, fixed-capacity buffers with hierarchical resource ownership.
-//! No caching, implicit growth, shared views, or unbudgeted Vec escape hatches.
+//! Fixed-capacity buffers, immutable views, bounded caching and byte queues.
+//! No implicit growth or unbudgeted Vec escape hatches.
 //!
 //! ```
 //! use terraris::{buffer::{BufferLayout, BufferScope}, resource::{Budget, Limits}};
@@ -25,9 +25,19 @@
 mod error;
 mod layout;
 mod lease;
+mod pool;
+mod queue;
 mod scope;
+mod shared;
+mod storage;
 
 pub use error::{Error, Region};
 pub use layout::BufferLayout;
 pub use lease::BufferLease;
+pub use pool::{BufferPool, PoolConfig, PoolSnapshot};
+pub use queue::{
+    BufferQueue, BufferSender, QueueError, QueueItem, QueueLimits, QueuePermit, QueueSnapshot,
+    SendError, bounded_queue,
+};
 pub use scope::BufferScope;
+pub use shared::SharedBuffer;

@@ -27,6 +27,9 @@ pub enum Error {
     },
     AllocationFailed,
     AllocationSizeMismatch,
+    InvalidRange,
+    InvalidPoolConfig,
+    PoolClosed,
     NotWritable,
     PayloadSealed,
     NoSpace {
@@ -62,6 +65,9 @@ impl fmt::Display for Error {
             Self::AllocationSizeMismatch => {
                 f.write_str("storage size does not match reserved buffer layout")
             }
+            Self::InvalidRange => f.write_str("shared buffer range is out of bounds"),
+            Self::InvalidPoolConfig => f.write_str("invalid buffer pool size classes or limits"),
+            Self::PoolClosed => f.write_str("buffer pool is closed or has been dropped"),
             Self::NotWritable => {
                 f.write_str("clear the consumed or truncated buffer before writing new data")
             }

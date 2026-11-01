@@ -2,7 +2,8 @@
 
 use super::Error;
 
-/// Exact storage layout. B1 does not round up to a future pool size class.
+/// Exact logical layout. A pooled allocation may retain a larger size class,
+/// but that excess space does not expand the writable payload/header limits.
 /// Zero-length payloads and even entirely empty layouts are valid; an empty
 /// lease still consumes one resource allocation slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

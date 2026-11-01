@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-use std::fmt;
+use std::{fmt, sync::Weak};
 
-use super::{BufferLayout, BufferLease, Error};
+use super::{BufferLayout, BufferLease, Error, pool::PoolInner, storage::allocate_zeroed};
 use crate::resource::{Limits, Scope, Snapshot};
 
-/// Allocates exact layouts against one resource scope. All clones share the
-/// same quotas. B1 has no idle cache or size-class rounding.
+/// Allocates against one resource scope; all clones share its quotas. new()
+/// uses exact allocations; BufferPool::scope() opts into bounded class caching.
 #[derive(Clone)]
 pub struct BufferScope {
-    resources: Scope,
-    max_allocation: usize,
+    pub(super) resources: Scope,
+    pub(super) max_allocation: usize,
+    pub(super) pool: Option<Weak<PoolInner>>,
 }
 
 impl BufferScope {
@@ -21,6 +22,7 @@ impl BufferScope {
         Ok(Self {
             resources,
             max_allocation,
+            pool: None,
         })
     }
 
@@ -28,6 +30,7 @@ impl BufferScope {
         Ok(Self {
             resources: self.resources.child(limits)?,
             max_allocation: self.max_allocation,
+            pool: self.pool.clone(),
         })
     }
     pub fn snapshot(&self) -> Snapshot {
@@ -41,6 +44,11 @@ impl BufferScope {
     }
 
     pub fn try_lease(&self, layout: BufferLayout) -> Result<BufferLease, Error> {
+        if let Some(pool) = &self.pool {
+            let pool = pool.upgrade().ok_or(Error::PoolClosed)?;
+            let mut leases = pool.lease_many(&self.resources, self.max_allocation, &[layout])?;
+            return Ok(leases.pop().expect("single checked-out buffer"));
+        }
         self.validate(layout)?;
         let reservation = self.resources.try_reserve(layout.capacity())?;
         let storage = allocate_zeroed(layout.capacity())?;
@@ -51,6 +59,13 @@ impl BufferScope {
     /// If a later allocation fails, earlier buffers and unused reservations
     /// are dropped: no partial batch is ever handed to the caller.
     pub fn try_lease_many(&self, layouts: &[BufferLayout]) -> Result<Vec<BufferLease>, Error> {
+        if let Some(pool) = &self.pool {
+            return pool.upgrade().ok_or(Error::PoolClosed)?.lease_many(
+                &self.resources,
+                self.max_allocation,
+                layouts,
+            );
+        }
         self.lease_many_with(layouts, allocate_zeroed)
     }
 
@@ -103,19 +118,6 @@ impl fmt::Debug for BufferScope {
             .field("resources", &self.resources)
             .finish()
     }
-}
-
-fn allocate_zeroed(capacity: usize) -> Result<Box<[u8]>, Error> {
-    // Stable, safe, fallible allocation followed by initialization. The final
-    // boxed slice has exactly the reserved logical capacity. Allocator overhead
-    // is outside this budget's accounting, and process-aborting OOM is not a
-    // recoverable error. No resize/reserve escape hatch is exposed to callers.
-    let mut storage = Vec::new();
-    storage
-        .try_reserve_exact(capacity)
-        .map_err(|_| Error::AllocationFailed)?;
-    storage.resize(capacity, 0);
-    Ok(storage.into_boxed_slice())
 }
 
 #[cfg(test)]

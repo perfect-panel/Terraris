@@ -1,6 +1,6 @@
 # Terraris 架构设计
 
-状态：架构基线。日期：2026-11-01。Rust 基础工程、PPanel 接口层及 B1 的 resource/buffer 已实现，当前能力见 [README](../README.md)。后续继续[基础设施](infrastructure.md)和 [Buffer 系统](buffer.md)的共享、缓存与 I/O 能力，再实现用户及控制面运行时。协议运行时、更新生命周期和运维默认值仍是后续方案，不代表已经部署验证。
+状态：架构基线。日期：2026-11-01。Rust 基础工程、PPanel 接口层及 B1/B2 的 resource/buffer 已实现，当前能力见 [README](../README.md)。后续继续[基础设施](infrastructure.md)的任务管理和基础 I/O，再实现用户及控制面运行时。协议运行时、更新生命周期和运维默认值仍是后续方案，不代表已经部署验证。
 
 Terraris 以 Polaris 的实际模块和生命周期为架构基线：`panel` 隔离面板协议，`supervisor` 管服务器配置代次，`controller` 管单协议用户与维护任务，`protocol::runtimekit` 统一运行时装配，`protocol::flow` 统一数据面策略。通过 Rust 的所有权、类型和异步任务模型实现这些边界。
 
@@ -49,7 +49,7 @@ TCP 字节流和 UDP 数据报分别建模。QUIC 流可以交付字节流接口
 
 初期使用一个 Cargo package，包含二进制入口和可测试的内部模块，模块命名与 Polaris 对齐。现成 Rust 协议引擎以依赖引入；需要自研且可独立复用的引擎再单独拆 crate。crate 数量不决定架构分层，跨模块依赖规则从第一版生效。
 
-以下是目标模块划分；当前已实现 `app`、`config`、`panel` 及 resource/buffer 的 B1 能力，其他模块按基础设施和运行时阶段引入，不建立空实现：
+以下是目标模块划分；当前已实现 `app`、`config`、`panel` 及 resource/buffer 的 B1/B2 能力，其他模块按基础设施和运行时阶段引入，不建立空实现：
 
 | 拟定 Rust 模块 | 职责 | Polaris 对应位置 |
 | --- | --- | --- |
@@ -345,7 +345,7 @@ SS2022 库的 `set_user_manager` 提供 EIH 多用户入口，但这不足以证
 | --- | --- | --- |
 | M0 架构设计 | Polaris 架构映射与 PPanel 接口契约 | 已完成模块、端口和状态所有权设计 |
 | M1a 基础工程与面板接口 | Rust 工程、PanelConnection、完整 PPanel 客户端、只读检查 CLI | 已通过本地 JSON/Protobuf 契约测试及 Go 编码样本互操作；真实部署联调待完成 |
-| M1b 基础设施与 Buffer | resource、buffer、task/time、network/codec、基础 dataplane 与指标 | B1 的分级预算、独占 buffer、批量回滚及测试已完成；共享/缓存、调度与完整 I/O 继续推进 |
+| M1b 基础设施与 Buffer | resource、buffer、task/time、network/codec、基础 dataplane 与指标 | B1/B2 的分级预算、独占/共享 buffer、缓存、队列及测试已完成；调度与完整 I/O 继续推进 |
 | M1c 控制面与协议可行性 | scheduler、users、Supervisor/Controller、RuntimeKit、模拟运行时和 SS2022 适配原型 | 复用 M1b；候选失败不开放代次准入、不推进验证器；协议多用户与热更新接口可用 |
 | M2 首个代理闭环 | SS2022 TCP/UDP、用户快照、流处理、限速与设备准入 | 真实兼容客户端互通；用户撤销取消在途拨号；跨节点竞争同一设备名额不超限 |
 | M3 生产运行基础 | 持久化上报、更新恢复、退出与服务包装 | 响应丢失、重启恢复、存储失败、证书替换、长期离线、负载与资源限额测试 |

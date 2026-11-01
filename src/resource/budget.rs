@@ -127,6 +127,9 @@ impl Budget {
     pub fn snapshot(&self) -> Snapshot {
         self.root_scope().snapshot()
     }
+    pub(crate) fn owns(&self, scope: &Scope) -> bool {
+        Arc::ptr_eq(&self.inner, &scope.inner)
+    }
     /// Stops new reservations, including in descendants. Previously granted
     /// reservations and resident permits remain valid until their owners drop.
     pub fn close(&self) {
@@ -287,6 +290,79 @@ impl Scope {
         Ok(reservations)
     }
 
+    /// Pool checkout transaction: cached allocations already own process
+    /// capacity, while BOTH cached and fresh entries need new scope capacity.
+    pub(crate) fn try_reserve_backings(
+        &self,
+        requests: &[BackingRequest<'_>],
+    ) -> Result<Vec<BackingReservation>, Error> {
+        let mut global = Usage::default();
+        let mut scoped = Usage::default();
+        for request in requests {
+            let bytes = match request {
+                BackingRequest::New(bytes) => {
+                    global.bytes = global
+                        .bytes
+                        .checked_add(*bytes)
+                        .ok_or(Error::SizeOverflow)?;
+                    global.allocations += 1;
+                    *bytes
+                }
+                BackingRequest::Cached(permit) => {
+                    if !Arc::ptr_eq(&self.inner, &permit._charge.scope.inner) {
+                        return Err(Error::ForeignBudget);
+                    }
+                    permit._charge.cost.bytes
+                }
+            };
+            scoped.bytes = scoped.bytes.checked_add(bytes).ok_or(Error::SizeOverflow)?;
+            scoped.allocations += 1;
+        }
+        let mut grants = Vec::new();
+        grants
+            .try_reserve_exact(requests.len())
+            .map_err(|_| Error::MetadataAllocationFailed)?;
+        let mut state = self.inner.lock();
+        self.check_open(&state)?;
+        // Impossible batches must not evict caches while retrying pressure.
+        check_limit(self.inner.limits, Usage::default(), scoped, 0)?;
+        for node in self.nodes() {
+            check_limit(node.limits, Usage::default(), scoped, node.depth)?;
+        }
+        check_limit(
+            self.inner.limits,
+            state.reserved.plus(state.resident),
+            global,
+            0,
+        )?;
+        for node in self.nodes() {
+            check_limit(
+                node.limits,
+                node.reserved().plus(node.resident()),
+                scoped,
+                node.depth,
+            )?;
+        }
+        state.reserved = state.reserved.plus(global);
+        for node in self.nodes() {
+            node.set_usage(node.reserved().plus(scoped), node.resident());
+        }
+        for request in requests {
+            grants.push(match request {
+                BackingRequest::New(bytes) => BackingReservation::New(self.reservation(*bytes)),
+                BackingRequest::Cached(permit) => BackingReservation::Cached(CachedReservation {
+                    charge: Charge {
+                        scope: self.clone(),
+                        cost: permit._charge.cost,
+                        phase: Phase::Reserved,
+                        target: Target::Scopes,
+                    },
+                }),
+            });
+        }
+        Ok(grants)
+    }
+
     fn reservation(&self, bytes: usize) -> Reservation {
         Reservation {
             charge: Charge {
@@ -394,12 +470,16 @@ struct Charge {
 impl Charge {
     fn commit(&mut self) {
         let mut state = self.scope.inner.lock();
-        subtract(&mut state.reserved, self.cost);
-        state.resident = state.resident.plus(self.cost);
-        for node in self.scope.nodes() {
-            let mut reserved = node.reserved();
-            subtract(&mut reserved, self.cost);
-            node.set_usage(reserved, node.resident().plus(self.cost));
+        if matches!(self.target, Target::All | Target::Global) {
+            subtract(&mut state.reserved, self.cost);
+            state.resident = state.resident.plus(self.cost);
+        }
+        if matches!(self.target, Target::All | Target::Scopes) {
+            for node in self.scope.nodes() {
+                let mut reserved = node.reserved();
+                subtract(&mut reserved, self.cost);
+                node.set_usage(reserved, node.resident().plus(self.cost));
+            }
         }
         self.phase = Phase::Resident;
     }
@@ -514,4 +594,31 @@ pub(crate) struct AllocationPermit {
 }
 pub(crate) struct ScopePermit {
     _charge: Charge,
+}
+
+impl AllocationPermit {
+    pub(crate) fn is_closed(&self) -> bool {
+        self._charge.scope.inner.lock().closed
+    }
+}
+
+pub(crate) enum BackingRequest<'a> {
+    New(usize),
+    Cached(&'a AllocationPermit),
+}
+pub(crate) enum BackingReservation {
+    New(Reservation),
+    Cached(CachedReservation),
+}
+
+pub(crate) struct CachedReservation {
+    charge: Charge,
+}
+impl CachedReservation {
+    pub(crate) fn commit(mut self) -> ScopePermit {
+        self.charge.commit();
+        ScopePermit {
+            _charge: self.charge,
+        }
+    }
 }

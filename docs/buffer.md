@@ -1,6 +1,6 @@
 # Terraris Buffer 系统设计
 
-状态：B1 已实现，后续能力仍为设计。日期：2026-11-01。当前提供预算许可、BufferLayout、BufferScope、独占 BufferLease、固定容量操作和批量预留/失败回滚。共享视图、缓存池、队列和异步额度等待尚未实现。
+状态：B1/B2 已实现，协议 I/O 集成仍待后续阶段。日期：2026-11-01。当前提供预算许可、独占/共享 buffer、Bytes 适配、受限缓存池、混合批次预留及有界队列。物理分配仍用同步 try 操作；异步等待针对队列额度，并要求截止时间。
 
 核心决定：缓冲拥有者持有资源许可，池只负责复用已分配存储，队列单独控制消息数和字节数。通过独占可写对象与不可变共享视图区分修改和传递，最后一个拥有者释放后才允许回收。
 
@@ -14,7 +14,7 @@
 
 ## 2 类型与职责
 
-以下覆盖目标系统的接口职责。当前公开 API 是 BufferLayout、BufferLease 和 BufferScope；Allocation 为内部类型，其余共享/缓存/队列类型待 B2 引入。
+当前公开 API 包含 BufferLayout、BufferLease、BufferScope、SharedBuffer、BufferPool 和队列端口；Allocation/Owner 为内部类型。下表中的 Packet 网络元数据封装留待 B3。
 
 | 类型 | 所有权和职责 | 约束 |
 | --- | --- | --- |
@@ -25,9 +25,9 @@
 | `BufferPool` | 按尺寸类别缓存 Allocation，管理闲置容量 | 不是无界全局缓存，不持有用户对象 |
 | `BufferScope` | 连接/子流的预算身份 | 最后保留视图消失前，用量不能归零 |
 | `Packet` | 网络元数据及一个 buffer | 明确包边界，与存储生命周期分开 |
-| `BufferQueue` | 有界消息数、逻辑字节数和队列许可 | 入队项继续持有分配与作用域许可 |
+| `BufferSender` / `BufferQueue` / `QueuePermit` | MPSC 发送、接收、字节/消息双维度许可 | 入队项继续持有分配与作用域许可 |
 
-Allocation 当前采用固定长度、已初始化的 `Box<[u8]>`，由安全的 fallible Vec 预留及初始化构造。独占状态不为每块 payload 再包一层 Arc；B2 第一次冻结时再创建共享拥有者，视图记录范围。
+Allocation 采用固定长度、已初始化的 `Box<[u8]>`，由安全的 fallible Vec 预留及初始化构造。独占状态不为每块 payload 再包一层 Arc；第一次冻结时才创建共享拥有者，视图记录范围。
 
 B1 的资源 API 为 Budget、Scope、Limits、Reservation、Permit 和 Snapshot。进程及全部祖先额度在同一把短锁下检查；原子字段只用于安全共享存储，不意味着无锁算法。Scope 的深度有 32 层上限，Limits 同时控制字节数和分配名额，零容量 lease 也占一个名额。
 
@@ -54,13 +54,13 @@ allocation capacity
 | append trailer | 显式消耗后置空间，封包过程结束 payload 写入阶段 |
 | consume / truncate | 只调整有效范围，不释放 backing allocation 的预算 |
 | freeze | 消费 BufferLease，转为 SharedBuffer；payload 不复制 |
-| grow / detach | 显式申请新存储并复制；旧、新分配重叠期间都计量 |
+| copy_to | 显式申请目标作用域的新存储并复制；旧、新分配重叠期间都计量 |
 
 不开放任意 `set_len`、`DerefMut<Vec<u8>>`、隐式 reserve 或脱离许可的 `into_vec`。布局不足返回结构化错误，不 panic，也不悄悄扩容。B1 的 read_from 使用 ReadBuf，仅在一次 poll 成功后提交 filled 字节；满 buffer 返回错误，不返回容易误解为 EOF 的零长度。
 
-B1 在 append_trailer（包括零长度）后封口 payload，仍允许追加剩余 trailer 和外层 header。实际 consume/truncate 后进入只读消耗状态，clear 恢复初始布局。freeze、grow 和 detach 尚未开放。
+append_trailer（包括零长度）封口 payload，仍允许追加剩余 trailer 和外层 header。实际 consume/truncate 后进入只读消耗状态，clear 恢复初始布局。freeze 和 SharedBuffer::copy_to 已实现；原地解冻、自动扩容和 grow 尚未开放。
 
-新分配初始化一次，缓存复用时清空逻辑范围。新暴露的 header、tag、padding 区域必须先初始化，I/O 路径只能提交其实际写入长度；codec 不能把 capacity 当数据长度。用跨连接哨兵数据验证旧 payload 不会被读出或发送。密钥和长期凭据使用单独的保密存储，不进入通用包池。
+新分配初始化一次，B2 缓存复用在锁外清零整块存储并清空逻辑范围，保证接收方 ReadBuf 也不能观察上一次借用的内容。这会有按容量清零的成本，后续性能比较需包含该成本。新暴露的 header、tag、padding 也先初始化，I/O 只提交实际 filled 长度；codec 不能把 capacity 当数据长度。密钥和长期凭据不进入通用包池；clear 或缓存归还本身不承诺安全擦除。
 
 前后空间由目标封装链汇总。不能假定所有协议只在尾部加 tag；Polaris 的 [headroom 修复](../../../Polaris/internal/dataplane/coalesce.go)说明普通写入与合并写入都需要遵守同一布局约定。
 
@@ -83,7 +83,7 @@ stateDiagram-v2
 
 共享视图必须持有 owning handle，不能只携带裸范围。一个 1 字节切片保留着 64 KiB 原始分配时，仍计量 64 KiB；原始对象先 Drop 不能提前归还预算或把内存交给另一个连接。
 
-通过 [Bytes::from_owner](https://docs.rs/bytes/latest/bytes/struct.Bytes.html#method.from_owner) 交给外部库时，将存储、回收状态和许可一起交给 owner。所有 Bytes Clone/切片释放后才结束 owner 生命周期。该构造方式转回 BytesMut 会复制，try_into_mut 也不能恢复原可写存储，因此不把它设计成无成本双向转换。
+通过 [Bytes::from_owner](https://docs.rs/bytes/latest/bytes/struct.Bytes.html#method.from_owner) 交给外部库时，将存储、回收状态和许可一起交给 owner。持有 owner 的 Bytes Clone/非空切片释放后才结束生命周期。Bytes 自行产生的空切片可能不保留 owner；SharedBuffer 的空切片则仍保留。转回 BytesMut 会复制，try_into_mut 也不能恢复原可写存储；外部复制不自动纳入预算，Bytes 的原生 Debug 也可能显示内容。
 
 需要修改共享数据时，第一版显式申请新块并复制。以后可以增加内部唯一引用恢复操作，但不把一次引用计数检查当成跨线程永久保证，也不让外部 Bytes 适配绕过拥有者。
 
@@ -94,26 +94,27 @@ stateDiagram-v2
 ### 分配容量
 
 ```text
-resident_capacity = active_allocation_capacity + idle_cached_capacity
-budget_used = resident_capacity + reserved_not_yet_allocated
+budget_used = resident_capacity + reserved_capacity
 budget_used <= configured_buffer_budget
 ```
 
 这里计量 buffer 层管理的分配容量，不是进程 RSS。分配器额外开销、对象元数据、栈、内核 socket、TLS/QUIC 内部缓冲及外部库自行分配的内存另有上限或观测，不能宣称一个 buffer budget 控制整个进程。
 
-进程容量许可跟随 Allocation 从创建到真正释放。B1 的 reserved/resident 分别表示未完成存储分配的预留与已提交容量；其和始终参与上限检查。B2 多个视图共享一个 Allocation 时只计一次，返回池后仍占 resident_capacity，只有真正销毁分配才归还进程容量许可。
+进程许可跟随 Allocation 到真正释放。resident 是已提交分配，可能活跃、闲置或被准备中的批次选中；reserved 是已授予但尚未 commit 的新分配额度，涵盖批次中已经准备好但尚未提交的存储。二者之和参与硬上限检查。共享视图只计一次，缓存归还不释放进程容量。PoolSnapshot 的 pending 还包含选中的旧缓存，不能把它直接加到 Budget.used 上重复计量。
 
 ### 作用域容量
 
 连接和子流配额按所保留的完整 backing allocation 计量。当前租约的最后一个视图消失后，作用域许可归还；Allocation 可留在池中，进程许可继续存在。
 
-跨连接共享默认禁止隐式改变归属。作用域转移仅限唯一拥有者；共享视图通过新作用域预算内复制转交。不能删除一个已结束连接的计量记录后继续保留其视图。
+共享视图始终保留原作用域归属；跨作用域传递一个 clone 不会重新计量到接收方。需要改变归属时通过 copy_to 在目标作用域复制；当前没有原地作用域转移 API，不能删除已结束连接的计量记录后继续保留其视图。
 
 ### 队列容量
 
 队列同时限制消息数和逻辑字节数。共享同一分配的多个队列项各自消耗逻辑队列额度，但进程分配只计一次；元数据、空包和极短切片由消息数限制约束。
 
 [Tokio 有界 mpsc](https://docs.rs/tokio/latest/tokio/sync/mpsc/index.html)限制消息数量，可变大小帧仍需额外的字节许可。一个消息数上限不能单独保证缓冲内存上限。
+
+当前实现使用一个协调状态在消息数与字节两个维度同时授予 QueuePermit，避免分别等待两种额度。逻辑上限覆盖已入队项和已授予但未发送的许可；尚在等待的 send future 持有其 item，由 item 的 buffer owner 继续约束物理容量，任务数量仍需 B3 管理。
 
 ## 6 申请、缓存与释放
 
@@ -123,6 +124,8 @@ budget_used <= configured_buffer_budget
 4. 预算被其他尺寸的闲置块占满时，淘汰闲置块，在实际释放后归还容量，再重试；不能让不匹配缓存造成永久等待。
 5. 归还时结束作用域租约；允许缓存则转移 Allocation，否则释放分配及进程许可。所有路径只执行一次。
 
+缓存和新分配可以混合在同一个批次：进程额度只为新块增加，作用域额度对全部块增加。整批存储准备完成后才产生可交付租约；后续分配失败或 unwind 会释放全部准备项和许可，选中的缓存块可能在回滚时被释放。淘汰重试次数受闲置块数配置限制，不会在并发归还下无限循环。
+
 预留容量必须立即进入 budget_used，避免多个并发申请在实际分配前超卖额度。能返回的分配失败须撤销预留；系统分配器因 OOM 直接终止进程不属于可恢复保证。销毁存储先释放 backing storage，再归还对应容量许可。
 
 池持有的回收上下文不能强引用池本身形成环。活跃租约使用弱回收引用，池关闭或消失时，最后一次 Drop 直接释放分配。关闭后拒绝新租约、释放闲置块并唤醒等待者；已借出的 buffer 仍有效直到拥有者释放。
@@ -131,11 +134,11 @@ budget_used <= configured_buffer_budget
 
 ## 7 尺寸类别
 
-B1 按布局的精确容量分配，不做尺寸类别取整。B2 缓存的初始候选尺寸为 4、16、32、64 KiB，按完整 prefix + payload + suffix 选择能容纳的类别。这些是待基准验证的起点，不是所有协议的固定读包大小。
+普通 BufferScope::new 按布局精确分配；BufferPool::scope 显式启用缓存。PoolConfig::standard 使用 4、16、32、64 KiB，亦可提供最多 32 个严格递增的类别。按完整布局选择类别，不能超出 max_allocation 或作用域永久上限；无合适类别时使用不缓存的精确分配。类别大小仍需基准验证，不是固定读包大小。
 
 - 普通流以每方向 16 KiB 为比较基线，不提前增加向量批次或延迟合并。
 - 超过最大缓存类别的合法包使用受预算控制的专用分配，释放后不进入通用池。
-- max_allocation、各类别闲置块数、总闲置字节和总 resident 字节分别配置。
+- max_allocation、各类别闲置块数、总闲置字节/块数和进程总预算分别限制；零闲置限制禁用保留。缓存槽位元数据按上限预分配，不包含在 payload 字节口径中。
 - UDP 接收大小按协议允许的最大数据报设置；不能把 4 KiB 或链路 MTU 当成通用 UDP 上限。大包加上 headroom/tag 可能超过 64 KiB 的缓存类别。
 - QUIC DATAGRAM 协商限制、应用分片及重组由协议适配器校验，buffer 不自行改变 wire 格式。
 
@@ -155,11 +158,15 @@ TCP 双向 relay 在接入时一次性取得最低前进所需的两个 buffer �
 
 UDP/QUIC 包路径优先使用非阻塞申请或短期限等待。队列满时按协议策略拒绝或丢弃新包并计数，不能无限等待导致整个接收循环停顿。重组缓存单独限制每会话字节、分片数及生命周期。
 
-异步申请有 Waiting、Granted、Consumed/Cancelled 状态。取消与授予同时发生时，要么把拥有许可的句柄交给调用者，要么完整归还，不能既丢失许可又没有拥有者。等待者数量本身有界；不采用不受控轮询或唤醒全部等待者。
+队列异步申请有 Waiting、Granted、Consumed/Cancelled 状态。取消与授予同时发生时，要么交付许可，要么完整归还。等待者数量有界，采用 FIFO：头部大请求暂时挡住后续小请求；try 操作也不越过已有等待者。只唤醒已获额度者，关闭时唤醒所有剩余等待者；取消等待者的查找为 O(W)，W 受配置约束。
 
 多层配额不能实现为“拿住一层，再 await 另一层”。可用协调器原子预留所需组合；单一计数限制可复用 Tokio Semaphore。其 [FIFO 与 acquire_many 行为](https://docs.rs/tokio/latest/tokio/sync/struct.Semaphore.html)可能让大请求挡住小请求，初版要明确公平策略并测量等待延迟。
 
-队列优先提供 reserve(cost) 后同步转移所有权的方式。try_send 失败返回原对象；直接 send(buffer) 的 future 被丢弃时，buffer 和未使用队列许可一起释放，不能承诺一个被取消的 future 仍能把 buffer 返回给调用者。
+队列提供 reserve(cost, deadline) 后同步转移所有权，send 校验实际长度。截止时间仅限制取得许可的过程，已返回的 QueuePermit 不自动过期。try_send 或正常返回的 send 错误包含原对象；send future 被丢弃时，item 和等待/未消费许可一起释放，不能承诺被取消 future 仍能返回 item。
+
+close 拒绝所有后续发送，包括旧 QueuePermit，但保留已入队项供排空；接收端 Drop 直接丢弃队列项。已返回的未提交许可在 Drop 时退还额度。最后一个发送端释放后，尚存的有效许可仍可发送；没有发送端、许可和队列项时 recv 返回 None。用户析构和唤醒在队列锁外执行。
+
+池的 close 与队列关闭语义分开：池不撤销先前授予的准备批次或活跃视图，最后引用结束后直接释放存储；trim 只释放当前闲置块，池可继续缓存。一个预算可被多个池共享，但淘汰只发生在请求所属池内；推荐进程统一使用一个池。关闭资源 Budget 不自动销毁池，退出时仍需关闭 Pool。
 
 依赖控制帧推动数据消费的协议，必须为控制帧保留独立小额预算和队列槽位。数据队列吃满预算后，关闭或窗口更新帧仍需有前进路径。
 
@@ -175,7 +182,7 @@ UDP 发送提交完整数据报或返回失败，截断接收明确丢弃或报�
 
 ## 10 观测和验证
 
-至少提供 resident、active、idle、在途预留、等待者、池命中/未命中、专用分配、复制字节数、申请拒绝、队列丢包和等待时长。小视图保留大分配的情况记录聚合指标，不记录 payload 或用户标识。
+B2 已提供 Budget 的 reserved/resident 快照，PoolSnapshot 的 idle/pending/leased 容量与名额、命中/未命中、淘汰和预算拒绝次数，以及 QueueSnapshot 的 queued/reserved、等待者、发送端和关闭状态。跨层快照不是跨锁事务。复制字节、丢包和等待时长的聚合指标留给后续 telemetry 集成，不记录 payload 或用户标识。
 
 关键用例：
 

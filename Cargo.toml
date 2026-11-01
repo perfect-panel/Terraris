@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 async-trait = "0.1"
+bytes = "1.12.1"
 clap = { version = "4.5", features = ["derive"] }
 prost = "0.14.4"
 prost-types = "0.14.4"
@@ -27,6 +28,7 @@ protoc-bin-vendored = "3.3"
 [dev-dependencies]
 axum = "0.8"
 tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }
 
 [lints.rust]
 unsafe_code = "forbid"

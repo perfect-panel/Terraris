@@ -16,6 +16,7 @@ pub enum Error {
     Closed,
     SizeOverflow,
     MetadataAllocationFailed,
+    ForeignBudget,
     /// Depth zero denotes the process budget. A request above `limit` cannot
     /// succeed even after all existing owners release their permits.
     Exhausted {
@@ -36,6 +37,7 @@ impl fmt::Display for Error {
             Self::Closed => f.write_str("resource scope is closed"),
             Self::SizeOverflow => f.write_str("reservation byte total overflows usize"),
             Self::MetadataAllocationFailed => f.write_str("cannot allocate reservation metadata"),
+            Self::ForeignBudget => f.write_str("cached allocation belongs to a different budget"),
             Self::Exhausted {
                 dimension,
                 depth,

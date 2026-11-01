@@ -22,6 +22,8 @@
 mod budget;
 mod error;
 
-pub(crate) use budget::{AllocationPermit, ScopePermit};
+pub(crate) use budget::{
+    AllocationPermit, BackingRequest, BackingReservation, CachedReservation, ScopePermit,
+};
 pub use budget::{Budget, Limits, MAX_SCOPE_DEPTH, Permit, Reservation, Scope, Snapshot, Usage};
 pub use error::{Dimension, Error};

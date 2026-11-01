@@ -2,7 +2,7 @@
 
 Terraris 是参考 Polaris 架构设计的 PPanel Rust 节点端项目，负责代理协议接入、用户认证、限速与设备准入，以及节点状态、在线设备和流量上报。
 
-当前已完成 Rust 基础工程、PPanel 面板客户端，以及 B1 的 resource/buffer 底层模块。代理协议、Supervisor/Controller 运行循环、限速执行及持久化上报尚未实现；当前二进制用于配置与只读联通检查，不监听代理端口或自动上报在线状态。
+当前已完成 Rust 基础工程、PPanel 面板客户端，以及 B1/B2 的 resource/buffer 模块。代理协议、Supervisor/Controller 运行循环、限速执行及持久化上报尚未实现；当前二进制用于配置与只读联通检查，不监听代理端口或自动上报在线状态。
 
 - [架构设计](docs/architecture.md)：模块边界、状态管理、协议规划、故障处理与实施阶段。
 - [PPanel 接口契约](docs/ppanel-api.md)：当前 backend 的实际接口、身份与计量语义、兼容性要求。
@@ -21,7 +21,7 @@ Terraris 是参考 Polaris 架构设计的 PPanel Rust 节点端项目，负责�
 - API 路径前缀、请求超时、请求与响应大小限制；禁用自动重定向及 HTTP 自动重试；错误不保留 URL query、远端消息或响应体。
 - 订阅 ID 保持 int64 精度，规范化 Hysteria 协议名和 IPv4-mapped 地址，按协议读取当前证书指纹。
 - resource 支持进程/多级作用域的字节与分配数量上限、原子批量预留、Reserved/Resident 快照、RAII 归还及关闭语义。
-- buffer 提供受检 BufferLayout、独占 BufferLease、固定容量封包、清零 padding、受限读取及批量分配失败回滚。当前没有缓存池、共享切片或异步额度等待。
+- buffer 提供固定容量 BufferLease、SharedBuffer 共享切片和 Bytes 所有权适配；支持受限缓存池、混合批量预留，以及字节/消息双限额队列。
 
 设备租约、用户限制和流量接口目前由 library 暴露；这不代表已经有数据面执行这些策略。
 
@@ -32,12 +32,27 @@ Terraris 是参考 Polaris 架构设计的 PPanel Rust 节点端项目，负责�
 - `Limits` 同时限制字节和分配名额；零长度 buffer 也占一个名额。子作用域上限不得大于父级，最大嵌套深度为 32。
 - `try_reserve_many` 在同一作用域一次性预留所有请求，进程和每一级祖先都参与检查；它返回独立的 Reservation，消费 `commit()` 后成为 Permit。未提交或已提交许可都通过 Drop 自动归还。
 - `try_lease_many` 在分配任何 payload 存储前取得整批预算，后续分配失败时回收已分配块和剩余预留，调用方不会得到半个批次。
-- `BufferLayout` 为 headroom + payload capacity + tailroom 的精确大小，B1 不向上取整到缓存类别。预算按完整分配计量，不随 readable length 缩小。
+- `BufferLayout` 定义 headroom + payload capacity + tailroom 的逻辑大小。普通 BufferScope 按精确大小分配，池化 Scope 可能选择更大类别；预算按完整 backing capacity 计量，多余容量不扩大可写范围。
 - payload 不能占用 trailer 预留；添加 trailer 后 payload 封口。consume/truncate 后要先 clear 才能重新封包。clear 清空逻辑范围，不释放容量，也不承诺安全擦除。
 - `read_from` 只提交成功读取的 filled 字节；空间耗尽是错误，不会冒充 EOF。取消持有 buffer 的任务后，等待其结束才能确认资源已经归还。
 - close 阻止新的预留和子作用域，不撤销现有拥有者；关闭前取得的 Reservation 仍可提交。取消任务与强制结束由后续 TaskGroup 层负责。
 
 当前预算约束的是受管理存储容量及分配名额，不能当作进程 RSS 上限。元数据、分配器开销和外部网络库内存不在字节口径内。批量预留只覆盖同一个作用域，跨分支组合预留尚未提供。
+
+## B2 共享缓存与队列
+
+- `BufferLease::freeze` 消费独占租约，`SharedBuffer::slice` 返回受检只读视图，`into_bytes` 转交拥有者；均不复制 payload。小视图仍保留整块容量和原作用域配额，最后一个拥有者消失才归还。
+- `SharedBuffer::copy_to` 显式取得目标作用域预算并复制，可把大块上的短视图转为独立小块；新旧内存重叠期间都计量。没有原地解冻或隐式扩容。
+- `BufferPool::new` 绑定进程 Budget，通过 `pool.scope` 选择池化分配。PoolConfig 控制尺寸类别、总闲置字节、总闲置块数和每类上限；standard 使用 4/16/32/64 KiB。超大块和无法满足本地单块/作用域上限的类别使用专用精确分配。
+- 闲置缓存继续占进程预算，复用只取得新的作用域配额。缓存与新块可在同批原子预留；容量不足时淘汰本池未被当前批次选中的闲置块。失败批次不留下借用或预留，缓存内容可能因淘汰或回滚改变。
+- 缓存块在锁外完整清零后再交给借用者。`trim` 释放闲置块并保留缓存能力；`close` 或最后一个 Pool 句柄释放后，不再接收新借用，活跃视图仍有效直至最终释放。Scope 和视图不强引用 Pool。
+- `bounded_queue<T>` 返回 BufferSender 和唯一 BufferQueue 接收端。T 实现 QueueItem，队列长度按逻辑 payload 计；自定义项的长度在排队期间必须不变。BufferLease、SharedBuffer 和 Bytes 已适配。
+- `try_send` 失败返回原对象；`reserve(bytes, deadline).await` 在字节和消息两个维度一次授予许可，`QueuePermit::send` 校验实际长度。等待者数量受限，采用 FIFO 授予，大请求可能挡住后面的小请求。
+- 丢弃 reserve future 会撤销等待或归还已授予但未消费的许可；丢弃 send future 还会释放其携带的 item。close 拒绝后续发送并允许排空已入队项，接收端 Drop 则丢弃队列内容。close 后，先前授予的未提交 QueuePermit 也不能发送。
+
+BufferScope 的物理容量申请仍是同步 try 操作；B2 的异步等待只针对队列容量，并要求 deadline。PoolSnapshot 提供闲置/准备中/借出容量与命中、未命中、淘汰计数；QueueSnapshot 区分排队、已预留和等待者。资源 Budget 是硬额度的依据，各层指标快照不构成跨锁事务。
+
+Bytes 自己创建的空切片可能不保留原 owner，转为 BytesMut 或其他容器也可能产生预算外复制；不要把外部 Bytes 的全部行为当作 SharedBuffer 的预算契约。SharedBuffer 的 Debug 隐藏数据，Bytes 仍有原生 Debug 行为。Rustdoc 包含池和队列的可执行示例。
 
 ## 构建与本地检查
 
@@ -89,7 +104,7 @@ cargo build --locked --release
 
 测试使用本地 HTTP 模拟面板，覆盖全部端点、两种编码、条件请求、大小限制、取消、错误脱敏及报告不重试。另有[使用 backend Go 绑定生成的互操作样本](tests/fixtures/README.md)，正常 Rust 测试无需 Go。
 
-资源和 buffer 测试覆盖作用域聚合、并发批次争用、close/申请竞态、取消回收、零长度名额、溢出、封包边界，以及后续分配失败和 unwind 时的整批回滚。Rustdoc 还验证 BufferLease 无法 Clone。
+资源和 buffer 测试覆盖作用域聚合、混合批次与缓存淘汰、共享/Bytes 生命周期、关闭和取消竞态、零长度名额、溢出、封包边界，以及分配失败和 unwind 回滚。队列使用可控时间验证 FIFO、超时和授予/取消交错；Rustdoc 验证 BufferLease、QueuePermit 无法 Clone，SharedBuffer 不可写。
 
 [CI 配置](.github/workflows/ci.yml) 在 Linux 和 macOS 上执行格式、Clippy、测试及 release 构建。当前本地验证不等于生产面板、Redis/PostgreSQL 或 Linux 部署联调。
 

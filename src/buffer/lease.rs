@@ -1,18 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-use std::{fmt, future::poll_fn, io, pin::Pin, task::Poll};
+use std::{fmt, future::poll_fn, io, pin::Pin, sync::Arc, task::Poll};
 
 use tokio::io::{AsyncRead, ReadBuf};
 
-use super::{BufferLayout, Error, Region};
-use crate::resource::{AllocationPermit, Reservation, ScopePermit};
-
-struct Allocation {
-    // Fields drop in declaration order: storage must be freed before its
-    // process capacity is made available for another allocation.
-    storage: Box<[u8]>,
-    _permit: AllocationPermit,
-}
+use super::{
+    BufferLayout, Error, Region, SharedBuffer,
+    storage::{Allocation, Owner},
+};
+use crate::resource::Reservation;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
@@ -30,10 +26,7 @@ enum Phase {
 /// fn duplicate(buffer: BufferLease) { let _ = buffer.clone(); }
 /// ```
 pub struct BufferLease {
-    // End the connection lease before dropping the allocation. The process
-    // charge remains owned by Allocation until AFTER its storage is freed.
-    _scope_permit: ScopePermit,
-    allocation: Allocation,
+    owner: Owner,
     layout: BufferLayout,
     start: usize,
     end: usize,
@@ -53,25 +46,43 @@ impl BufferLease {
             return Err(Error::AllocationSizeMismatch);
         }
         let (allocation_permit, scope_permit) = reservation.commit().into_parts();
-        Ok(Self {
-            _scope_permit: scope_permit,
-            allocation: Allocation {
-                storage,
-                _permit: allocation_permit,
-            },
+        Ok(Self::from_owner(
+            Owner::new(
+                Allocation {
+                    storage,
+                    permit: allocation_permit,
+                },
+                scope_permit,
+                None,
+            ),
+            layout,
+        ))
+    }
+
+    pub(super) fn from_owner(owner: Owner, layout: BufferLayout) -> Self {
+        Self {
+            owner,
             layout,
             start: layout.headroom(),
             end: layout.headroom(),
             trailer_used: 0,
             phase: Phase::Payload,
-        })
+        }
+    }
+
+    /// Freezes the current readable range without copying payload bytes.
+    pub fn freeze(self) -> SharedBuffer {
+        SharedBuffer {
+            owner: Arc::new(self.owner),
+            range: self.start..self.end,
+        }
     }
 
     pub fn layout(&self) -> BufferLayout {
         self.layout
     }
     pub fn capacity(&self) -> usize {
-        self.allocation.storage.len()
+        self.owner.storage().len()
     }
     pub fn len(&self) -> usize {
         self.end - self.start
@@ -80,11 +91,11 @@ impl BufferLease {
         self.start == self.end
     }
     pub fn as_slice(&self) -> &[u8] {
-        &self.allocation.storage[self.start..self.end]
+        &self.owner.storage()[self.start..self.end]
     }
     /// Only already-readable bytes can be edited; this cannot expand the range.
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        &mut self.allocation.storage[self.start..self.end]
+        &mut self.owner.storage_mut()[self.start..self.end]
     }
     pub fn remaining_payload(&self) -> usize {
         if self.phase == Phase::Payload {
@@ -110,7 +121,7 @@ impl BufferLease {
 
     pub fn append_payload(&mut self, data: &[u8]) -> Result<(), Error> {
         self.check_payload(data.len())?;
-        self.allocation.storage[self.end..self.end + data.len()].copy_from_slice(data);
+        self.owner.storage_mut()[self.end..self.end + data.len()].copy_from_slice(data);
         self.end += data.len();
         Ok(())
     }
@@ -119,16 +130,16 @@ impl BufferLease {
     pub fn append_zeroed(&mut self, length: usize) -> Result<&mut [u8], Error> {
         self.check_payload(length)?;
         let start = self.end;
-        self.allocation.storage[start..start + length].fill(0);
+        self.owner.storage_mut()[start..start + length].fill(0);
         self.end += length;
-        Ok(&mut self.allocation.storage[start..self.end])
+        Ok(&mut self.owner.storage_mut()[start..self.end])
     }
 
     pub fn prepend_header(&mut self, data: &[u8]) -> Result<(), Error> {
         self.check_frame()?;
         check_space(Region::Headroom, data.len(), self.start)?;
         let start = self.start - data.len();
-        self.allocation.storage[start..self.start].copy_from_slice(data);
+        self.owner.storage_mut()[start..self.start].copy_from_slice(data);
         self.start = start;
         Ok(())
     }
@@ -138,7 +149,7 @@ impl BufferLease {
     pub fn append_trailer(&mut self, data: &[u8]) -> Result<(), Error> {
         self.check_frame()?;
         check_space(Region::Tailroom, data.len(), self.remaining_tailroom())?;
-        self.allocation.storage[self.end..self.end + data.len()].copy_from_slice(data);
+        self.owner.storage_mut()[self.end..self.end + data.len()].copy_from_slice(data);
         self.end += data.len();
         self.trailer_used += data.len();
         self.phase = Phase::Sealed;
@@ -149,11 +160,11 @@ impl BufferLease {
         self.check_frame()?;
         check_space(Region::Tailroom, length, self.remaining_tailroom())?;
         let start = self.end;
-        self.allocation.storage[start..start + length].fill(0);
+        self.owner.storage_mut()[start..start + length].fill(0);
         self.end += length;
         self.trailer_used += length;
         self.phase = Phase::Sealed;
-        Ok(&mut self.allocation.storage[start..self.end])
+        Ok(&mut self.owner.storage_mut()[start..self.end])
     }
 
     /// Drops an already-written prefix without releasing its allocation budget.
@@ -198,7 +209,7 @@ impl BufferLease {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         poll_fn(|cx| {
             let mut read =
-                ReadBuf::new(&mut self.allocation.storage[self.end..self.layout.payload_limit()]);
+                ReadBuf::new(&mut self.owner.storage_mut()[self.end..self.layout.payload_limit()]);
             match Pin::new(&mut *reader).poll_read(cx, &mut read) {
                 Poll::Pending => Poll::Pending,
                 Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
