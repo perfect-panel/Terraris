@@ -1,0 +1,86 @@
+[
+  {
+    "cipher": "aes-128-gcm",
+    "length": "d370edc131022477e0abdd9a05b9252cde53",
+    "master": "3360573845c373935fba03360e65d778",
+    "password": "fixture-passphrase",
+    "payload": "112835e56bb4e8e9236ca29bebf8469ee3d693f2ab24b64020e83c5ddf9f85e99d97d89289a959",
+    "plaintext": "independent AEAD vector",
+    "salt": "808182838485868788898a8b8c8d8e8f",
+    "subkey": "d7aaba02a1006db5ddbe08831c2541ea"
+  },
+  {
+    "cipher": "aes-192-gcm",
+    "length": "03c9781cdfbf3741288023946e28496c6889",
+    "master": "3360573845c373935fba03360e65d7783be3deded879bd26",
+    "password": "fixture-passphrase",
+    "payload": "3744fbd59e89f76b267268bd803c20da4c3d366fab95059c809149960a9a5befc63517f9fc297c",
+    "plaintext": "independent AEAD vector",
+    "salt": "808182838485868788898a8b8c8d8e8f9091929394959697",
+    "subkey": "e2d91e393586d9f3791d2f2d62e70e8480129e7ced0e8ec6"
+  },
+  {
+    "cipher": "aes-256-gcm",
+    "length": "b8f5e5bb10bc6a6aa1ec473c9d5558f5cb10",
+    "master": "3360573845c373935fba03360e65d7783be3deded879bd265474f8e6853d758e",
+    "password": "fixture-passphrase",
+    "payload": "dbfc245d96395ba6e13ba8333c0f664963ae0b5135ed4cfdd0394778d3dfe3000f5d57a0174c5d",
+    "plaintext": "independent AEAD vector",
+    "salt": "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f",
+    "subkey": "bafbe14e03649bc6b96cf635c56ed7fba30f7c68667e3c68ebf6991e6944de73"
+  },
+  {
+    "cipher": "chacha20-ietf-poly1305",
+    "length": "2fe2c41f34fb97c201201ef90206b0e720cb",
+    "master": "3360573845c373935fba03360e65d7783be3deded879bd265474f8e6853d758e",
+    "password": "fixture-passphrase",
+    "payload": "2d1b3da22544db6b340ae5a2f5d2ef713962731d55014827db79be0fce99f726dbfc0c54c2fe02",
+    "plaintext": "independent AEAD vector",
+    "salt": "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f",
+    "subkey": "bafbe14e03649bc6b96cf635c56ed7fba30f7c68667e3c68ebf6991e6944de73"
+  },
+  {
+    "cipher": "xchacha20-ietf-poly1305",
+    "length": "068c31e40c9665e9e105f16da957382d03a0",
+    "master": "3360573845c373935fba03360e65d7783be3deded879bd265474f8e6853d758e",
+    "password": "fixture-passphrase",
+    "payload": "c3c39b0bf317c916c6afc459206ada37526bd9ad1f75623fe9c95b01d02035b9d5e62239c6a19c",
+    "plaintext": "independent AEAD vector",
+    "salt": "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f",
+    "subkey": "bafbe14e03649bc6b96cf635c56ed7fba30f7c68667e3c68ebf6991e6944de73"
+  },
+  {
+    "cipher": "2022-blake3-aes-128-gcm",
+    "identity_header": "30be55082fc7e892e0f7e2843a3353ff",
+    "length": "a355eb6a866af5bf93fec9486dfb8e760b51",
+    "master": "000102030405060708090a0b0c0d0e0f",
+    "password": "AAECAwQFBgcICQoLDA0ODw==",
+    "payload": "43b6b15e9b21281c10e8aac2e6b0e4c31bc3da827fe5d4b2168234f185232ff35942b2c231617c",
+    "plaintext": "independent AEAD vector",
+    "salt": "808182838485868788898a8b8c8d8e8f",
+    "server_key": "404142434445464748494a4b4c4d4e4f",
+    "subkey": "722b3033c5d021365a8521bfb41157a3"
+  },
+  {
+    "cipher": "2022-blake3-aes-256-gcm",
+    "identity_header": "33d6ebfabf77668fa3e13f062c3468e0",
+    "length": "4ef6694519e156c046d6d18c6a9c77371ce4",
+    "master": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "password": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+    "payload": "0e243e1bf6cf794a7aa7a74ef56c6cab1466adea3a736af1a30e1ef4a4a8df4cc854cefd39922a",
+    "plaintext": "independent AEAD vector",
+    "salt": "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f",
+    "server_key": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+    "subkey": "11289b9d205255930f83932405c2b0a38ec32be703fe33f290ff25ffeff402f9"
+  },
+  {
+    "cipher": "2022-blake3-chacha20-poly1305",
+    "length": "3b2ebcfe1dce4844ea963665192c50aac33e",
+    "master": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "password": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+    "payload": "7e79fe785525afd1c801292a36c9d6ac2cde3ecd5bdbe11e43ac9da840b5dd103ddece6a5cd010",
+    "plaintext": "independent AEAD vector",
+    "salt": "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f",
+    "subkey": "11289b9d205255930f83932405c2b0a38ec32be703fe33f290ff25ffeff402f9"
+  }
+]

@@ -133,6 +133,13 @@ impl Registry {
                 .expect("builtin proxy");
         }
         builder
+            .register(
+                "shadowsocks",
+                &["ss"],
+                Arc::new(crate::protocol::shadowsocks::OutboundFactory::default()),
+            )
+            .expect("builtin Shadowsocks outbound");
+        builder
     }
     pub fn builtin() -> Self {
         Self::builtin_builder().build()

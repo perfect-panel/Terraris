@@ -168,6 +168,13 @@ impl Registry {
         builder
             .register(super::trojan::NAME, &[], trojan)
             .map_err(|_| Error::Preparation("builtin protocols"))?;
+        let shadowsocks = Arc::new(super::shadowsocks::Factory::new(
+            connection.clone(),
+            transports.clone(),
+            stream_options.clone(),
+            policy,
+            builder.metrics.clone(),
+        )?);
         let anytls = Arc::new(super::stream::Factory::new(
             connection,
             Arc::new(super::anytls::Factory),
@@ -177,6 +184,9 @@ impl Registry {
         )?);
         builder
             .register(super::anytls::NAME, &[], anytls)
+            .map_err(|_| Error::Preparation("builtin protocols"))?;
+        builder
+            .register(super::shadowsocks::NAME, &["ss"], shadowsocks)
             .map_err(|_| Error::Preparation("builtin protocols"))?;
         builder
             .build()

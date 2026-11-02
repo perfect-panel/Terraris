@@ -17,3 +17,5 @@ pub mod socksaddr;
 pub mod stream;
 pub mod trojan;
 pub mod uot;
+
+pub mod shadowsocks;

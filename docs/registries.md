@@ -4,8 +4,8 @@ Node 使用 `Supervisor<protocol::Registry>`。新增协议或流传输时，实
 
 | 注册表 | 扩展接口 | 当前内置实现 |
 | --- | --- | --- |
-| `protocol::Registry` | `protocol::InboundFactory` → `ProtocolDriver` | VLESS、Trojan、AnyTLS |
-| `outbound::Registry` | `outbound::registry::Factory` → `Connector` | direct/freedom、block/blackhole/reject、dns、socks5/socks、http、vless |
+| `protocol::Registry` | `protocol::InboundFactory` → `ProtocolDriver` | VLESS、Trojan、AnyTLS、Shadowsocks/ss |
+| `outbound::Registry` | `outbound::registry::Factory` → `Connector` | direct/freedom、block/blackhole/reject、dns、socks5/socks、http、vless、shadowsocks/ss |
 | `transport::Registry` | `transport::Factory` → `Inbound` / `Outbound` | tcp/raw、ws/websocket、grpc、httpupgrade/http-upgrade、xhttp/splithttp；均可组合标准 TLS |
 
 TLS 是 TCP 工厂根据 `security` 配置准备的包装层。客户端保留证书链、服务器名和 ALPN 校验，以及显式的 `allow_insecure` 设置；服务端通过 `certificate::Settings` 加载本地 PEM，明确使用 rustls/aws-lc-rs。WebSocket、gRPC 和 HTTP Upgrade 通过独立工厂组合该 TLS 层；XHTTP 通过 h3/Quinn 提供 HTTP/3 QUIC；REALITY 尚未实现。UDP 载荷仍通过现有 `PacketPort` / `DatagramTransport` 接口传递；本次传输注册表提供字节流载体。
@@ -74,3 +74,5 @@ TLS 身份通过 `Inbound::reload_required` → `ProtocolDriver::reload_required
 传输多流调度在 `protocol::ingress::multiplex` 中持有所有逻辑流 future，与 HTTP/2 驱动一起取消和回收；gRPC 出站池另持有有界连接任务，`Outbound` / `Connector` 的 abort、idle、close 钩子由 egress Engine 统一驱动；关闭必须等待任务回收。具体设置和边界见 [流传输文档](stream-transports.md)。
 
 HTTP/3 使用 `Listener::accept_carrier` 返回尚未完成握手的 `Accepted::Quic`，由 `Inbound::open_carrier` 在协议准入后应用当前代次 TLS 参数。监听器退出调用异步 `close` 关闭并等待 QUIC Endpoint。XHTTP 兼容代次共享会话表；模式、资源边界和配置差异见 [XHTTP 文档](xhttp.md)。
+
+Shadowsocks 使用独立的认证记录和原生 UDP 适配器，复用同一控制面及 flow 策略。TCP 继续经过 transport/ingress 注册表；UDP 每个地址只有一个接收所有者，配置代次通过弱路由切换。认证、关联、回复及停止任务均有上限和明确所有者，详见 [Shadowsocks 文档](shadowsocks.md)。

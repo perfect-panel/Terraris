@@ -1,6 +1,6 @@
 # 路由、DNS 与代理出站
 
-`route` 编译 PPanel 规则，`dns` 提供解析和缓存，`outbound` 实现出站协议，`egress` 统一执行策略。VLESS、Trojan、AnyTLS 的 TCP/UDP、XUDP 和 UoT 共用此路径；认证、设备准入、用户限速及计量继续由原有 flow 层承担。
+`route` 编译 PPanel 规则，`dns` 提供解析和缓存，`outbound` 实现出站协议，`egress` 统一执行策略。VLESS、Trojan、AnyTLS、Shadowsocks 的 TCP/UDP、XUDP 和 UoT 共用此路径；认证、设备准入、用户限速及计量继续由原有 flow 层承担。
 
 ## 规则语义
 
@@ -57,12 +57,13 @@ DNSSEC 标志可以转发，但当前不进行本地 DNSSEC 验证。没有 DoQ�
 | socks / socks5 | CONNECT，支持用户名/密码 | UDP ASSOCIATE，保留控制连接；可选 UoT | 可选标准 TLS |
 | http | HTTP/1.1 CONNECT，支持 Basic 凭据 | 可选 UoT；未启用时拒绝 | 可选标准 TLS |
 | vless | 原生 VLESS | XUDP 或 UoT | 可选标准 TLS、VLESS Encryption |
+| shadowsocks / ss | AEAD 2017 / 2022 | 原生 SS UDP 或 UoT | 协议 AEAD；TCP 可组合标准 TLS |
 
 标准 TLS 校验证书与 SNI，支持附加 CA。只有面板明确设置 `allow_insecure=true` 才跳过证书链/名称验证。HTTP 出站只协商 HTTP/1.1。VLESS 出站支持 `native/xorpub/random`、1-RTT/0-RTT、公钥链与 padding；恢复失败使票据失效，应用数据不会自动重放。加密客户端当前使用 AES-256-GCM；入站仍接受两种已实现的 AEAD。
 
 SOCKS5 UDP 仅接收已连接中继的报文；未指定的中继地址绑定到实际 TCP 代理对端。控制连接结束即结束关联。不支持 SOCKS UDP 分片。XUDP 部分写入被取消后会关闭该载体，防止下一条报文接在半帧之后。
 
-代理出站不含 SOCKS4、Shadowsocks、VMess、Trojan、AnyTLS，也不含 REALITY、Vision、uTLS 指纹或额外的协议多路复用。代理出站已支持 [XHTTP](xhttp.md)、WebSocket、gRPC、HTTP Upgrade，见 [流传输文档](stream-transports.md)。相关字段不会被静默忽略。SOCKS5/HTTP/VLESS 出站的 UoT 配置见 [TLS 与 UoT](tls-protocols.md)。
+代理出站不含 SOCKS4、VMess、Trojan、AnyTLS，也不含 REALITY、Vision、uTLS 指纹或额外的协议多路复用。代理出站已支持 [XHTTP](xhttp.md)、WebSocket、gRPC、HTTP Upgrade，见 [流传输文档](stream-transports.md)。相关字段不会被静默忽略。[Shadowsocks 配置](shadowsocks.md)单独说明密码与 EIH。SOCKS5/HTTP/VLESS 出站的 UoT 配置见 [TLS 与 UoT](tls-protocols.md)。
 
 ## 配置与重载
 

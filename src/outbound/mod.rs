@@ -5,6 +5,7 @@ mod packet;
 mod proxy;
 pub mod registry;
 use crate::{network::Address, time::StopReason};
+pub(crate) use packet::FramedPacket;
 pub use packet::{Direct, Packet, PacketPort};
 pub use proxy::{Kind, Proxy};
 pub use registry::{Connector, Registry};

@@ -36,7 +36,7 @@ Trojan framing follows the [official protocol](https://github.com/trojan-gfw/tro
 
 [tests/interop/proxy](tests/interop/proxy) is an optional Go peer pinned to those upstream modules. It uses the actual upstream AnyTLS session client and UoT implementation to exercise the Rust server. The pinned Xray binary also exercises Trojan TCP/UDP. These helpers are not production dependencies.
 
-TLS identities use rustls with its explicit aws-lc-rs provider. The Rust `md-5` dependency identifies the public AnyTLS padding policy only; it is not used for authentication, signing or encryption. User authentication uses SHA-224 (Trojan) or SHA-256 (AnyTLS) as required by their wire formats.
+TLS identities use rustls with its explicit aws-lc-rs provider. Within AnyTLS, the Rust `md-5` dependency identifies the public padding policy; user authentication uses SHA-224 (Trojan) or SHA-256 (AnyTLS) as required by their wire formats. Classic Shadowsocks separately uses MD5 for its wire-required password derivation, described below.
 
 ## Web stream transports
 
@@ -51,3 +51,11 @@ gRPC framing follows the [gRPC HTTP/2 protocol](https://github.com/grpc/grpc/blo
 The HPACK Huffman code-length table in `src/transport/xhttp/wire.rs` comes from `golang.org/x/net/http2/hpack/tables.go` (Go Authors), implementing RFC 7541 Appendix B. Its BSD-3-Clause notice is retained in [LICENSES/Go-BSD-3-Clause.txt](LICENSES/Go-BSD-3-Clause.txt).
 
 [tests/interop/xhttp](tests/interop/xhttp) is an optional Go test peer compiled from an isolated archive of the pinned Polaris commit. It validates actual upstream client/server interoperability and is not part of normal Rust builds or deployment.
+
+## Shadowsocks AEAD and AEAD-2022
+
+`src/protocol/shadowsocks/` follows the official [AEAD specification](https://shadowsocks.org/doc/aead.html), [SIP022](https://shadowsocks.org/doc/sip022.html) and [SIP023](https://shadowsocks.org/doc/sip023.html). PPanel credential mapping and independent wire validation use [Polaris at 56d52fb44958ef3cc2a7fb841cd240f8206234b2](https://github.com/perfect-panel/Polaris/tree/56d52fb44958ef3cc2a7fb841cd240f8206234b2), including its `github.com/sagernet/sing-shadowsocks` fork. SagerNet Shadowsocks is Copyright (C) 2022 nekohasekai and licensed GPL-3.0-or-later; its notice is retained in [LICENSES/SagerNet-Shadowsocks.txt](LICENSES/SagerNet-Shadowsocks.txt). Terraris's integration uses GPL-3.0-only, with the full GPL text in the repository license.
+
+AEAD primitives use RustCrypto AES-GCM and ChaCha/XChaCha20-Poly1305. Classic password/subkey derivation uses the wire-required MD5 and HKDF-SHA1; AEAD-2022 uses BLAKE3's named derivation contexts. AES block operations implement SIP023 identity headers and the SIP022 UDP separate header. Cryptographic primitives are not reimplemented.
+
+[tests/interop/shadowsocks](tests/interop/shadowsocks) is a test-only Go peer built from an isolated archive of the pinned Polaris source. Its deterministic `vectors.json` checks password/subkey derivation, nonce progression, authenticated records and identity headers against independent Go implementations. Neither Go nor Polaris is a dependency of production builds.

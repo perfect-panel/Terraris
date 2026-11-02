@@ -287,7 +287,7 @@ DNS 和出站使用结构化能力声明。像 Polaris 的共享 Egress 一样�
 | TLS | [rustls](https://docs.rs/rustls/latest/rustls/) | 证书热替换、密码 provider、目标平台；常规 TLS 不代表支持 REALITY |
 | DNS | `hickory-proto` + Tokio/rustls/reqwest | DNS wire 编解码；Terraris 持有分域规则、缓存、并发、IPv4/IPv6 策略和超时 |
 | QUIC | [Quinn](https://docs.rs/quinn/latest/quinn/) | 流、DATAGRAM、资源限额；需额外实现 TUIC/Hysteria2 的协议层 |
-| Shadowsocks | [shadowsocks-rust 的库接口](https://docs.rs/shadowsocks/latest/shadowsocks/config/struct.ServerConfig.html) | EIH 多用户、认证身份提取、热更新、TCP/UDP 和计量接入 |
+| Shadowsocks | 原生 RustCrypto/BLAKE3 记录与数据报实现 | AEAD/2022、EIH 多用户、热更新、TCP/UDP、UoT、路由出站及计量；见 [协议文档](shadowsocks.md) |
 
 ### 协议推进顺序
 
@@ -297,9 +297,9 @@ DNS 和出站使用结构化能力声明。像 Polaris 的共享 Egress 一样�
 | 已完成协议扩展 | Trojan TCP/UDP、AnyTLS v1/v2、UoT、TLS 入站与本地 PEM 热重载 | 复用同一准入和流处理层；已验证 Xray Trojan 与官方 AnyTLS 客户端互通 |
 | 已完成传输扩展 | WebSocket、gRPC、HTTP Upgrade、XHTTP 的入站和出站 | gRPC 池、WS 早期数据、XHTTP HTTP/1.1/2/3 + XMUX；Xray/Polaris 双向互通、代次排空和资源回收已通过本地验证 |
 | 第二轮扩展 | TUIC v5、Hysteria2 | 各自独立互通矩阵；QUIC 需验证拥塞控制、UDP 和认证时序 |
-| 单独立项 | Shadowsocks 2022/传统 AEAD、REALITY、Vision、XHTTP、VMess 及其他协议 | 明确协议版本、实现来源、客户端互通与维护成本后排期 |
+| 单独立项 | REALITY、Vision、VMess 及其他协议 | 明确协议版本、实现来源、客户端互通与维护成本后排期 |
 
-SS2022 延后到后续扩展。其 `set_user_manager` 提供 EIH 多用户入口，但仍须单独验证在线替换、身份回传和撤销能否接入统一策略，不能用单密码服务器冒充多用户支持。
+Shadowsocks AEAD/2022 已接入独立的认证、重放及 UDP 关联管理，复用既有用户发布事务和 flow 策略；AES-2022 支持 EIH 多用户，非 EIH 模式有明确的试钥数量限制。标准 Go peer 验证双向 TCP/UDP，代码不嵌入 Go。
 
 同样，“使用 Quinn”只提供 QUIC 传输能力，不自动获得 TUIC/Hysteria2 认证、HTTP/3、混淆、拥塞行为或线协议兼容性。每种协议用明确的功能组合声明能力，例如密码套件、TCP/UDP、传输、安全层、插件、mux 和 UoT，而非一个笼统的“支持”开关。
 

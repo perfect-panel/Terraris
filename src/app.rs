@@ -119,10 +119,11 @@ pub async fn run() -> Result<(), Error> {
                 "infrastructure: tracked tasks, monotonic deadlines, budgeted TCP/UDP I/O, bounded codecs, metrics"
             );
             println!(
-                "proxy protocols: {}, {}, {} (TCP; UDP/XUDP/UoT; mlkem768x25519plus)",
+                "proxy protocols: {}, {}, {}, {} (TCP; UDP/XUDP/UoT; VLESS Encryption mlkem768x25519plus; Shadowsocks AEAD/2022)",
                 crate::protocol::vless::NAME,
                 crate::protocol::trojan::NAME,
-                crate::protocol::anytls::NAME
+                crate::protocol::anytls::NAME,
+                crate::protocol::shadowsocks::NAME
             );
             println!(
                 "transports: {} (inbound/outbound; raw/websocket/http-upgrade/splithttp aliases), XHTTP HTTP/1.1/2/3; TLS server/client via rustls/aws-lc-rs; VLESS encryption native/xorpub/random, 1-RTT/0-RTT",
@@ -142,7 +143,7 @@ pub async fn run() -> Result<(), Error> {
                 "registries: immutable protocol/outbound/stream factories; startup aliases and custom providers"
             );
             println!(
-                "routing: ordered domain/IP/GeoSite/GeoIP rules; direct/block/DNS/SOCKS5/HTTP/VLESS outbounds"
+                "routing: ordered domain/IP/GeoSite/GeoIP rules; direct/block/DNS/SOCKS5/HTTP/VLESS/Shadowsocks outbounds"
             );
             println!(
                 "dns: scoped UDP/TCP/DoH/DoT, bounded TTL and negative cache, query coalescing"

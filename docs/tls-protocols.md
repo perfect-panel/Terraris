@@ -1,6 +1,6 @@
 # TLS、Trojan、AnyTLS 与 UoT
 
-Terraris 的节点入站现包含 VLESS、Trojan 和 AnyTLS。三者共用路由、DNS、用户撤销、设备准入、限速、计量和配置发布流程。新增的 Trojan / AnyTLS 是入站实现；代理出站仍为 SOCKS5、HTTP CONNECT 和 VLESS。
+本文介绍 VLESS、Trojan 和 AnyTLS 入站；Shadowsocks 入站见[专门文档](shadowsocks.md)。这些协议共用路由、DNS、用户撤销、设备准入、限速、计量和配置发布流程。新增的 Trojan / AnyTLS 是入站实现；代理出站包括 SOCKS5、HTTP CONNECT、VLESS 和 [Shadowsocks](shadowsocks.md)。
 
 ## 协议组合
 
